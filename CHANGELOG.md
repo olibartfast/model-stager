@@ -16,6 +16,7 @@ All notable changes to this project are documented here, following
   ExecuTorch, DALI, and ensemble graphs.
 - `REPOSITORY_LAYOUT` for `triton`, `ovms`, and `neuriplo` filename conventions,
   with formats the target server cannot load refused before any conversion runs.
+  `neuriplo` targets this author's own runtime, not a third-party server.
 - TensorRT optimization profiles via `TRT_MIN_SHAPES` / `TRT_OPT_SHAPES` /
   `TRT_MAX_SHAPES`. A single `TRT_SHAPES` builds no profile, so it could not
   correctly build a dynamic-axis engine.
@@ -26,6 +27,6 @@ All notable changes to this project are documented here, following
 - `Dockerfile` with a swappable base — TensorRT for engine builds, `busybox` for
   a repository that needs no compilation.
 - Kubernetes examples for Triton and OVMS, and a compose example.
-- `tests/test-model-stager.sh`: 97 assertions with `trtexec` and the server
+- `tests/test-model-stager.sh`: 115 assertions with `trtexec` and the server
   stubbed on `PATH`, so no GPU, TensorRT, or server is required. CI runs it
   under `bash` and `dash`.
