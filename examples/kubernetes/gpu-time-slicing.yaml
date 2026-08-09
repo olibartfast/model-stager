@@ -1,0 +1,45 @@
+# GPU time-slicing for the NVIDIA device plugin.
+#
+# Required before two GPU-requesting pods can run on a single-GPU node. Without
+# it the node advertises nvidia.com/gpu: 1, the first pod takes it, and every
+# other pod requesting one stays Pending forever -- no error, no event beyond
+# "Insufficient nvidia.com/gpu", just a pod that never starts.
+#
+# Time-slicing makes the plugin advertise `replicas` logical devices backed by
+# the one physical GPU. Budget one per pod that holds a GPU at the same time. An
+# init container and its pod's main container never overlap, so a pod counts
+# once; two servers plus headroom is four.
+#
+# What this does NOT do:
+#
+#   - It does not partition memory. All replicas share the same VRAM, so two
+#     servers that each load a large engine can still hit CUDA OOM. On a 6 GB
+#     card that is a real limit, and it is the main reason to start both servers
+#     in explicit mode and let the client load only what it needs.
+#   - It does not isolate compute. Work from both servers is time-sliced onto
+#     the same device, so concurrent inference costs latency on both. For
+#     throughput under real concurrency, MPS (sharing.mps) is the better mode.
+#
+#   kubectl apply -f gpu-time-slicing.yaml
+#   helm upgrade nvdp nvdp/nvidia-device-plugin \
+#     -n nvidia-device-plugin --reuse-values \
+#     --set config.name=nvidia-plugin-config
+#
+# Then confirm the node advertises the replicas:
+#
+#   kubectl get node -o jsonpath='{.items[0].status.allocatable.nvidia\.com/gpu}'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-plugin-config
+  namespace: nvidia-device-plugin
+data:
+  default: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
