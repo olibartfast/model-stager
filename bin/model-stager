@@ -66,6 +66,14 @@
 #                          dynamic model needs these rather than that.
 #   TRT_EXTRA_ARGS         additional trtexec arguments
 #   TRT_FALLBACK_ONNX      when true, keep the ONNX if trtexec is unavailable
+#   MODELS                 which models to take from STAGE_DIR, comma or space
+#                          separated. Unset means all of them. This is the one
+#                          place a deployment names a model: an artifact image
+#                          can carry a whole catalogue while each deployment
+#                          stages the subset it serves, leaving the manifest
+#                          around it identical whatever is being served. A name
+#                          that is not in STAGE_DIR is an error, not a smaller
+#                          repository.
 #   STAGER_IGNORE_UNKNOWN  when true, skip unrecognized staged files instead of
 #                          failing. Off by default: a silently dropped artifact
 #                          surfaces much later as a 404 from a client.
@@ -85,6 +93,30 @@ ONNX_BACKEND="${ONNX_BACKEND:-tensorrt}"
 TRT_PRECISION="${TRT_PRECISION:-fp16}"
 TRT_FALLBACK_ONNX="${TRT_FALLBACK_ONNX:-false}"
 STAGER_IGNORE_UNKNOWN="${STAGER_IGNORE_UNKNOWN:-false}"
+MODELS="${MODELS:-}"
+
+# Which models to take out of STAGE_DIR. Unset means all of them.
+#
+# This is the one place a deployment names a model. An artifact image can carry a
+# whole catalogue and each deployment stage the subset it serves, so the manifest
+# around it -- names, probes, arguments, volumes -- stays identical whatever is
+# being served. Commas or spaces.
+MODELS_WANTED=$(printf '%s' "$MODELS" | tr ',;' '  ')
+MODELS_FOUND=""
+
+model_selected() {
+    [ -z "$MODELS_WANTED" ] && return 0
+    for model_wanted in $MODELS_WANTED; do
+        if [ "$model_wanted" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+model_mark_found() {
+    MODELS_FOUND="$MODELS_FOUND $1"
+}
 
 case "$ONNX_BACKEND" in
     tensorrt | onnx_runtime) ;;
@@ -418,7 +450,11 @@ for entry in "$STAGE_DIR"/*; do
     entry_name=$(basename "$entry")
 
     if [ -d "$entry" ]; then
+        if ! model_selected "$entry_name"; then
+            continue
+        fi
         stage_tree "$entry" "$entry_name"
+        model_mark_found "$entry_name"
         staged_any="yes"
         continue
     fi
@@ -428,6 +464,13 @@ for entry in "$STAGE_DIR"/*; do
         *) extension="" ;;
     esac
     model_name="${entry_name%.*}"
+
+    # Checked before the extension is judged, so an artifact image may carry
+    # formats this deployment does not select and does not have to be able to
+    # stage.
+    if ! model_selected "$model_name"; then
+        continue
+    fi
 
     case "$extension" in
         bin)
@@ -445,6 +488,7 @@ for entry in "$STAGE_DIR"/*; do
             ;;
         onnx | plan | engine | xml | pte | tflite | torchscript | pt | pb | dali | json)
             stage_flat "$entry" "$model_name" "$extension"
+            model_mark_found "$model_name"
             staged_any="yes"
             ;;
         *)
@@ -490,6 +534,32 @@ for entry in "$STAGE_DIR"/*.pbtxt; do
     # would report an empty repository and refuse to start.
     staged_any="yes"
 done
+
+# A requested model that was not in STAGE_DIR is an error, not a smaller
+# repository. Serving three of the four models a deployment asked for looks
+# healthy from every angle except the one client that needs the fourth, and it
+# fails as a 404 long after the artifact image that lacked it was built.
+if [ -n "$MODELS_WANTED" ]; then
+    models_missing=""
+    for model_wanted in $MODELS_WANTED; do
+        model_seen=""
+        for model_found in $MODELS_FOUND; do
+            if [ "$model_found" = "$model_wanted" ]; then
+                model_seen="yes"
+                break
+            fi
+        done
+        if [ -z "$model_seen" ]; then
+            models_missing="$models_missing $model_wanted"
+        fi
+    done
+    if [ -n "$models_missing" ]; then
+        echo "error: MODELS requested but not staged:$models_missing" >&2
+        echo "       staged directory holds:" >&2
+        ls -1 "$STAGE_DIR" >&2 || true
+        exit 1
+    fi
+fi
 
 if [ -z "$staged_any" ]; then
     # An empty repository is indistinguishable from a broken volume mount, so

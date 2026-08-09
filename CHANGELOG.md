@@ -27,6 +27,6 @@ All notable changes to this project are documented here, following
 - `Dockerfile` with a swappable base — TensorRT for engine builds, `busybox` for
   a repository that needs no compilation.
 - Kubernetes examples for Triton and OVMS, and a compose example.
-- `tests/test-model-stager.sh`: 115 assertions with `trtexec` and the server
+- `tests/test-model-stager.sh`: 132 assertions with `trtexec` and the server
   stubbed on `PATH`, so no GPU, TensorRT, or server is required. CI runs it
   under `bash` and `dash`.
