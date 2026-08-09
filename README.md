@@ -1,16 +1,23 @@
 # model-stager
 
-Server-neutral model repository staging and TensorRT preparation for Kubernetes
-inference workloads.
+Server-neutral, format-general model repository staging for Kubernetes inference
+workloads.
 
-Turns a directory of exported model artifacts into a versioned model repository
-tree, then gets out of the way:
+Turns a directory of heterogeneous model artifacts into a versioned model
+repository tree, then gets out of the way:
 
 ```
-/staging/detector.onnx          →   detector/1/model.plan      (compiled)
+/staging/detector.onnx          →   detector/1/model.plan       (compiled)
+/staging/classifier.tflite      →   classifier/1/model.tflite
 /staging/segmenter.xml + .bin   →   segmenter/1/model.xml + .bin
 /staging/pose.torchscript       →   pose/1/model.pt
+/staging/ecdet.pte              →   ecdet/1/model.pte
+/staging/preprocess.dali        →   preprocess/1/model.dali
 ```
+
+ONNX, TensorRT, OpenVINO IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI
+and ensemble graphs — mixed freely in one repository, each landing under the
+filename its target server recognizes.
 
 `<model>/<version>/<file>` is the layout Triton, OpenVINO Model Server, and
 neuriplo-kserve-runtime all read. Nothing here links the tree to the process
@@ -29,15 +36,23 @@ that serves it, so one image is an init container in front of any of them.
 
 ## Why a staging step exists
 
-Most model formats are portable: export once, ship the file, serve it anywhere.
-A TensorRT engine is not. It is compiled against a specific GPU, driver, and
-TensorRT version, and an engine built in CI, on a laptop, or in a `docker build`
-layer will not load on the cluster node.
+**Exported artifacts are not repository artifacts.** An exporter writes
+`yolo26n.onnx`, `raft.torchscript`, `ecdet.pte`. A server wants
+`yolo26n/1/model.onnx`, and it wants the TorchScript at `model.pt` if it is
+Triton and refuses it entirely if it is OVMS. Something has to map one to the
+other, and hand-writing that mapping per model is what makes deployments
+model-specific.
 
-So the artifact you ship cannot always be the artifact you serve, and something
-has to sit between them. That is this tool. Once it exists, running portable
-formats through the same path as a copy is nearly free, which is why there is
-one staging procedure rather than two.
+**Some artifacts cannot be shipped at all.** A TensorRT engine is compiled
+against a specific GPU, driver, and TensorRT version; one built in CI, on a
+laptop, or in a `docker build` layer will not load on the cluster node. So for
+that format the artifact you ship cannot be the artifact you serve, and the
+conversion has to happen on the node, at deploy time.
+
+The first reason applies to every format and is why this is a general tool. The
+second applies to one and is why it needs to run where it runs. Portable formats
+go through the same path as a copy, so there is one staging procedure rather
+than two.
 
 ## Quick start
 
