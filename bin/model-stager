@@ -4,10 +4,13 @@
 # Server-agnostic and format-general by construction. ONNX, TensorRT, OpenVINO
 # IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI and ensemble graphs mix
 # freely in one repository. The output is a versioned model repository
-# tree -- <model>/<version>/<file> -- which is the layout every KServe-compliant
-# server reads: Triton, OpenVINO Model Server, neuriplo-kserve-runtime. Nothing
-# in here links the tree to the process that will serve it, so one image is an
-# init container in front of any of them.
+# tree -- <model>/<version>/<file> -- the layout introduced by Triton
+# (https://github.com/triton-inference-server/server) and also read by OpenVINO
+# Model Server (https://github.com/openvinotoolkit/model_server). The neuriplo
+# layout targets this author's own runtime
+# (https://github.com/olibartfast/neuriplo-kserve-runtime). Nothing in here links
+# the tree to the process that will serve it, so one image is an init container
+# in front of any of them.
 #
 # By default it stages and exits, which is what an init container should do. Set
 # SERVER_EXEC to have it exec a server afterwards instead; that is only needed
@@ -171,20 +174,42 @@ model_override() {
 
 # Publishing a whole version directory at once keeps multi-file models (OpenVINO
 # .xml + .bin) atomic, which a per-file rename cannot. A rename within one
-# filesystem is atomic, and the target never exists because a populated version
-# directory short-circuits before we get here.
+# filesystem is atomic.
 publish() {
     publish_staging_dir="$1"
     publish_target_dir="$2"
+    if [ -e "$publish_target_dir" ]; then
+        # `mv a b` moves a *into* b when b is an existing directory, which would
+        # nest a temp directory inside the version rather than replace it, once
+        # per restart. already_staged should have short-circuited before here.
+        echo "error: refusing to publish over an existing $publish_target_dir" >&2
+        rm -rf "$publish_staging_dir"
+        exit 1
+    fi
     mkdir -p "$(dirname "$publish_target_dir")"
     mv "$publish_staging_dir" "$publish_target_dir"
     echo "staged $publish_target_dir"
 }
 
-# True when the version directory already holds something, so a restart against a
-# warm volume neither rebuilds an engine (minutes) nor re-copies a model.
+# True when the version directory exists, so a restart against a warm volume
+# neither rebuilds an engine (minutes) nor re-copies a model.
+#
+# Existence, not non-emptiness: a Triton ensemble's version directory is legally
+# empty -- the model is declared entirely in config.pbtxt -- and treating empty
+# as unstaged made every restart re-stage it. A version directory only ever
+# exists because a publish succeeded; a failed run removes its temp directory and
+# never creates the target.
 already_staged() {
-    [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
+    [ -d "$1" ]
+}
+
+# A Triton ensemble declares itself in config.pbtxt and has no model file. This
+# is how a GPU pre/post-processing pipeline is expressed -- a DALI model decodes
+# and resizes, a TensorRT model infers, and the ensemble wires them -- so
+# recognizing it is what makes those pipelines stageable at all.
+is_ensemble_config() {
+    grep -qE '^[[:space:]]*(platform[[:space:]]*:[[:space:]]*"ensemble"|ensemble_scheduling)' \
+        "$1" 2>/dev/null
 }
 
 convert_onnx() {
@@ -437,12 +462,33 @@ done
 for entry in "$STAGE_DIR"/*.pbtxt; do
     [ -f "$entry" ] || continue
     model_name=$(basename "$entry" .pbtxt)
+
     if [ ! -d "$MODEL_REPOSITORY/$model_name" ]; then
+        # An ensemble has no model file of its own: the graph lives entirely in
+        # config.pbtxt and the version directory is legally empty. So a config
+        # with no model beside it is a whole model when it declares an ensemble,
+        # and an orphaned overlay -- almost always a basename typo -- otherwise.
+        if is_ensemble_config "$entry"; then
+            ensemble_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
+            mkdir -p "$ensemble_dir"
+            cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
+            echo "staged ensemble $MODEL_REPOSITORY/$model_name (version $MODEL_VERSION empty by design)"
+            staged_any="yes"
+            continue
+        fi
         echo "error: $entry has no matching model in the repository" >&2
+        echo "       a config for a model that is not staged is usually a" >&2
+        echo "       basename mismatch; an ensemble needs platform: \"ensemble\"" >&2
         exit 1
     fi
+
     cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
     echo "applied config overlay $MODEL_REPOSITORY/$model_name/config.pbtxt"
+    # The model this configures is in the repository, so the run produced
+    # something servable. Without this, a restart whose staging directory holds
+    # only an ensemble config -- already staged, so nothing new is written --
+    # would report an empty repository and refuse to start.
+    staged_any="yes"
 done
 
 if [ -z "$staged_any" ]; then

@@ -3,8 +3,12 @@
 ## What this repository is
 
 `model-stager` turns a directory of exported model artifacts into a versioned
-model repository tree (`<model>/<version>/<file>`) and exits. That tree is what
-Triton, OpenVINO Model Server, and neuriplo-kserve-runtime all read.
+model repository tree (`<model>/<version>/<file>`) and exits. That layout comes
+from [Triton](https://github.com/triton-inference-server/server) and is also read
+by [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server); the
+`neuriplo` layout targets
+[neuriplo-kserve-runtime](https://github.com/olibartfast/neuriplo-kserve-runtime),
+this author's own runtime and the project this tool was extracted from.
 
 `bin/model-stager` is the whole tool. `README.md` is the specification.
 
@@ -32,10 +36,29 @@ a bug fix, and needs to be argued for explicitly:
 - **Idempotent and atomic.** Staging re-runs on every restart. Skip finished
   work; publish a version by renaming a temp directory, never file by file.
 
+## MANDATORY: How to refer to other projects
+
+Documentation is read by people who know none of these projects.
+
+- **Link every project on first mention**, in every file: `README.md`,
+  `AGENTS.md`, example manifests, commit messages. A bare name is not a
+  reference.
+- **Do not present this author's own projects as though they were established
+  third-party ones.** `neuriplo`, `neuriplo-kserve-runtime`, `neuriplo-tasks` and
+  this repository are personal projects with no user base. Listing them in the
+  same breath as Triton or OpenVINO Model Server implies a standing they do not
+  have. Say whose they are, and say what they are for.
+- **Attribute conventions to their origin.** The repository tree layout is
+  Triton's; other servers adopted it. Writing "the layout X, Y and Z all read"
+  implies three independent designs converged, which is not what happened.
+- **Claim only what is measured.** Timings need the hardware and the model size
+  they were measured on. Do not describe this tool as used, adopted, or
+  standard.
+
 ## Build, Test, and Development Commands
 
 ```bash
-tests/test-model-stager.sh                              # 97 assertions
+tests/test-model-stager.sh                              # 115 assertions
 shellcheck bin/model-stager tests/test-model-stager.sh
 ```
 
