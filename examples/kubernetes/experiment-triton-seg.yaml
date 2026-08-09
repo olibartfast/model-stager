@@ -1,0 +1,152 @@
+# Experiment: Triton serving TensorRT segmentation models, loaded on demand.
+#
+# Self-contained and isolated. Its own namespace, its own PVC, its own names --
+# it shares nothing with any other deployment and cannot reconfigure one. Apply
+# it, scale it, delete the namespace when finished.
+#
+#   models    rfdetr-seg, yolo26-seg  (names come from the staged filenames)
+#   layout    triton
+#   loading   explicit -- nothing resident until the client asks
+#
+# Created stopped (replicas: 0). Scale it up when you want to run it; scale it
+# back to 0 when done. On a single-GPU node that means one experiment at a time
+# unless you have configured GPU sharing yourself.
+#
+#   kubectl apply -f experiment-triton-seg.yaml
+#   kubectl -n exp-triton-seg scale deploy/triton-seg --replicas=1
+#   kubectl -n exp-triton-seg logs -f deploy/triton-seg -c model-stager
+#   ...
+#   kubectl -n exp-triton-seg scale deploy/triton-seg --replicas=0
+#
+# Requires an artifact image staging rfdetr-seg.onnx and yolo26-seg.onnx into
+# /staging with its own CMD, and a model-stager image whose TensorRT version
+# matches Triton's -- 25.12 ships TensorRT 10.14 on both sides. A mismatch builds
+# fine and fails at the client's first load call.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: exp-triton-seg
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-repo
+  namespace: exp-triton-seg
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-seg
+  namespace: exp-triton-seg
+  labels:
+    app: triton-seg
+spec:
+  replicas: 0
+  # A cold engine build takes minutes -- ~8.5 min for a 101 MB model on an RTX
+  # 3060 -- and runs in the init container before Triton starts. The 600s default
+  # would mark the rollout failed while the stager is still working.
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: triton-seg
+  template:
+    metadata:
+      labels:
+        app: triton-seg
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        - name: stage-artifacts
+          image: my-models:seg-v1
+          imagePullPolicy: Never
+          volumeMounts:
+            - {name: staging, mountPath: /staging}
+
+        - name: model-stager
+          image: model-stager:trt
+          imagePullPolicy: Never
+          env:
+            - {name: REPOSITORY_LAYOUT, value: triton}
+            - {name: STAGE_DIR, value: /staging}
+            - {name: MODEL_REPOSITORY, value: /models/repo}
+            - {name: MODEL_VERSION, value: "1"}
+            - {name: TRT_PRECISION, value: fp16}
+            # Shape variables are per-model on purpose. Set them only for an
+            # export with dynamic axes -- trtexec rejects explicit shapes on a
+            # static model outright, so one global setting breaks the static one.
+            # A dynamic model needs all three: a single TRT_SHAPES builds no
+            # optimization profile, producing an engine that cannot accept the
+            # range it was meant to serve.
+            # - {name: TRT_MIN_SHAPES_RFDETR_SEG, value: "input:1x3x432x432"}
+            # - {name: TRT_OPT_SHAPES_RFDETR_SEG, value: "input:1x3x432x432"}
+            # - {name: TRT_MAX_SHAPES_RFDETR_SEG, value: "input:4x3x432x432"}
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - {name: staging, mountPath: /staging}
+            - {name: models, mountPath: /models}
+
+      containers:
+        - name: tritonserver
+          image: nvcr.io/nvidia/tritonserver:25.12-py3
+          args:
+            - tritonserver
+            - --model-repository=/models/repo
+            # Without --load-model, explicit mode catalogues the repository and
+            # loads none of it. What is resident is the client's decision.
+            - --model-control-mode=explicit
+            - --http-port=8000
+            - --grpc-port=8001
+            - --metrics-port=8002
+          ports:
+            - {name: http, containerPort: 8000}
+            - {name: grpc, containerPort: 8001}
+            - {name: metrics, containerPort: 8002}
+          # Triton with default --strict-readiness is ready once the server is up
+          # and every loaded model is ready, vacuously true at zero models. This
+          # is its documented behaviour rather than something measured here; if a
+          # rollout hangs at readiness, move these to /v2/health/live.
+          startupProbe:
+            httpGet: {path: /v2/health/ready, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /v2/health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /v2/health/live, port: http}
+            periodSeconds: 20
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+
+      volumes:
+        - name: staging
+          emptyDir: {}
+        # Persisted so scaling to 0 and back does not rebuild the engines.
+        - name: models
+          persistentVolumeClaim:
+            claimName: model-repo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-seg
+  namespace: exp-triton-seg
+spec:
+  selector:
+    app: triton-seg
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+    - {name: grpc, port: 8001, targetPort: grpc}
+    - {name: metrics, port: 8002, targetPort: metrics}
