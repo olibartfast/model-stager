@@ -482,6 +482,156 @@ else
 fi
 
 # =============================================================================
+echo "=== Case 20: a GPU pre/post-processing ensemble stages end to end ==="
+new_case gpu-ensemble
+# The real shape of a GPU pipeline: DALI decodes and resizes on device, TensorRT
+# infers, and the ensemble wires them together. All three land in one repository.
+printf 'dali' >"$STAGE/preprocess.dali"
+printf 'onnx' >"$STAGE/detector.onnx"
+printf 'dali' >"$STAGE/postprocess.dali"
+cat >"$STAGE/yolo_pipeline.pbtxt" <<'PBTXT'
+name: "yolo_pipeline"
+platform: "ensemble"
+ensemble_scheduling {
+  step [
+    { model_name: "preprocess"  model_version: -1 },
+    { model_name: "detector"    model_version: -1 },
+    { model_name: "postprocess" model_version: -1 }
+  ]
+}
+PBTXT
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "preprocess/1/model.dali"
+expect_file "detector/1/model.plan"
+expect_file "postprocess/1/model.dali"
+# An ensemble has no model file: the graph is the config, and Triton requires the
+# version directory to exist but be empty.
+expect_file "yolo_pipeline/config.pbtxt"
+if [ -d "$REPO/yolo_pipeline/1" ] && [ -z "$(ls -A "$REPO/yolo_pipeline/1")" ]; then
+    pass "$CASE: ensemble version directory exists and is empty"
+else
+    fail "$CASE: ensemble version directory wrong"
+    find "$REPO/yolo_pipeline" | sed 's/^/      /'
+fi
+
+# =============================================================================
+echo "=== Case 21: an ensemble survives restarts unchanged ==="
+new_case ensemble-restart
+printf 'platform: "ensemble"\nensemble_scheduling { step [] }\n' >"$STAGE/pipeline.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+# Regression: an empty version directory read as "not staged", so every restart
+# re-staged it -- and `mv tmp dir` moves tmp *into* an existing dir, nesting one
+# temp directory per restart inside the ensemble's version.
+nested=$(find "$REPO/pipeline" -name '.stager-tmp.*' | wc -l)
+if [ "$nested" -eq 0 ]; then
+    pass "$CASE: no temp directory nested by restarts"
+else
+    fail "$CASE: $nested temp directories nested inside the ensemble"
+    find "$REPO/pipeline" | sed 's/^/      /'
+fi
+
+# =============================================================================
+echo "=== Case 22: a tree-form ensemble is staged as written ==="
+new_case ensemble-tree
+mkdir -p "$STAGE/seg_pipeline/2"
+printf 'platform: "ensemble"\n' >"$STAGE/seg_pipeline/config.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "seg_pipeline/config.pbtxt"
+if [ -d "$REPO/seg_pipeline/2" ]; then
+    pass "$CASE: tree-form ensemble keeps its version"
+else
+    fail "$CASE: version directory missing"
+fi
+
+# =============================================================================
+echo "=== Case 23: an orphaned overlay is still an error ==="
+new_case overlay-typo
+printf 'onnx' >"$STAGE/detector.onnx"
+# Not an ensemble, and names no staged model: almost always a basename typo, and
+# accepting it would leave a config nothing reads.
+printf 'input { name: "images" }\n' >"$STAGE/detektor.pbtxt"
+run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "no matching model in the repository"
+
+# =============================================================================
+echo "=== Case 24: neuriplo ensembles stay graph files ==="
+new_case neuriplo-ensemble
+printf 'dali' >"$STAGE/preprocess.dali"
+printf '{"steps":[]}' >"$STAGE/yolo_ensemble.json"
+run_stager
+expect_exit $? 0
+expect_file "preprocess/1/model.dali"
+expect_file "yolo_ensemble/1/model.json"
+
+# =============================================================================
+echo "=== Case 25: MODELS selects a subset of the artifact image ==="
+new_case models-subset
+# One artifact image carrying a catalogue; this deployment serves two of it.
+printf 'onnx' >"$STAGE/rfdetr-seg.onnx"
+printf 'onnx' >"$STAGE/yolo26-seg.onnx"
+printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
+printf 'onnx' >"$STAGE/yolo-pose.onnx"
+MODELS="rfdetr-pose,yolo-pose" run_stager
+expect_exit $? 0
+expect_file "rfdetr-pose/1/model.plan"
+expect_file "yolo-pose/1/model.plan"
+expect_absent "rfdetr-seg"
+expect_absent "yolo26-seg"
+# Unselected models must cost nothing: an engine build is minutes.
+if [ "$(wc -l <"$TRTEXEC_LOG")" -eq 2 ]; then
+    pass "$CASE: built only the selected models"
+else
+    fail "$CASE: built $(wc -l <"$TRTEXEC_LOG") engines, expected 2"
+fi
+
+new_case models-spaces
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'onnx' >"$STAGE/b.onnx"
+MODELS="a b" run_stager
+expect_exit $? 0
+expect_file "a/1/model.plan"
+expect_file "b/1/model.plan"
+
+# =============================================================================
+echo "=== Case 26: a requested model that is not staged is an error ==="
+new_case models-missing
+printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
+# Serving three of four looks healthy everywhere except the client that needs
+# the fourth, so a typo or a stale artifact image has to fail here.
+MODELS="rfdetr-pose,yolo-pose" run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "requested but not staged: yolo-pose"
+
+# =============================================================================
+echo "=== Case 27: MODELS unset still stages everything ==="
+new_case models-unset
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'pte' >"$STAGE/b.pte"
+run_stager
+expect_exit $? 0
+expect_file "a/1/model.plan"
+expect_file "b/1/model.pte"
+
+# =============================================================================
+echo "=== Case 28: MODELS selects tree-form models too ==="
+new_case models-tree
+mkdir -p "$STAGE/wanted/1" "$STAGE/unwanted/1"
+printf 'engine' >"$STAGE/wanted/1/model.plan"
+printf 'engine' >"$STAGE/unwanted/1/model.plan"
+MODELS=wanted run_stager
+expect_exit $? 0
+expect_file "wanted/1/model.plan"
+expect_absent "unwanted"
+
+# =============================================================================
 echo
 echo "=== Summary ==="
 echo "passed: $PASS"

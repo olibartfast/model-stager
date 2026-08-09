@@ -19,9 +19,18 @@ ONNX, TensorRT, OpenVINO IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI
 and ensemble graphs — mixed freely in one repository, each landing under the
 filename its target server recognizes.
 
-`<model>/<version>/<file>` is the layout Triton, OpenVINO Model Server, and
-neuriplo-kserve-runtime all read. Nothing here links the tree to the process
-that serves it, so one image is an init container in front of any of them.
+`<model>/<version>/<file>` is the
+[model repository layout](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_repository.md)
+introduced by [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server)
+and also read by [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server).
+Nothing here links the tree to the process that serves it, so one image is an
+init container in front of either.
+
+A third layout, `neuriplo`, targets
+[neuriplo-kserve-runtime](https://github.com/olibartfast/neuriplo-kserve-runtime)
+— my own [KServe v2](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/)
+runtime, and the project this tool was extracted from. It is here because that
+is what I deploy; it is not a convention anyone else uses.
 
 - [Why a staging step exists](#why-a-staging-step-exists)
 - [Quick start](#quick-start)
@@ -56,7 +65,8 @@ than two.
 
 ## Quick start
 
-As a Kubernetes init container in front of stock Triton:
+As a Kubernetes init container in front of stock
+[Triton](https://github.com/triton-inference-server/server):
 
 ```yaml
 initContainers:
@@ -116,7 +126,7 @@ tool growing a configuration language to describe the same thing indirectly.
 
 | Staged | Becomes | Action |
 |---|---|---|
-| `.onnx` | engine | `trtexec` compile — or copied, with `ONNX_BACKEND=onnx_runtime` |
+| `.onnx` | engine | [`trtexec`](https://github.com/NVIDIA/TensorRT/tree/main/samples/trtexec) compile — or copied, with `ONNX_BACKEND=onnx_runtime` |
 | `.plan`, `.engine` | engine | copy — a prebuilt engine, valid only if built on this node |
 | `.xml` | IR pair | copy `.xml` **and** rename its `.bin` to match |
 | `.pte`, `.tflite`, `.torchscript`, `.pt`, `.pb`, `.dali`, `.json` | as-is | copy |
@@ -136,7 +146,7 @@ than copied as-is — a plain copy produces a model that loads without weights.
 Servers agree on `<model>/<version>/` and disagree on what the file inside is
 called. `REPOSITORY_LAYOUT` picks the convention.
 
-| Staged | `triton` (default) | `ovms` | `neuriplo` |
+| Staged | `triton` (default) | `ovms` | `neuriplo` [^1] |
 |---|---|---|---|
 | TensorRT engine | `model.plan` | *refused* | `model.plan` |
 | ONNX | `model.onnx` | `model.onnx` | `model.onnx` |
@@ -148,14 +158,17 @@ called. `REPOSITORY_LAYOUT` picks the convention.
 | DALI | `model.dali` | *refused* | `model.dali` |
 | Ensemble graph | *refused* | *refused* | `model.json` |
 
+[^1]: `neuriplo` targets my own runtime rather than a third-party server. If you
+are not using it, ignore that column.
+
 "Refused" is a hard error naming the layout and the format, raised **before** any
 conversion runs. Writing the file anyway would cost minutes of engine build and
 produce a model the server never mentions, because a filename it does not
 recognize is one it silently ignores.
 
-Triton declares ensembles in `config.pbtxt` with `platform: "ensemble"` rather
-than as a graph file, so a `.json` ensemble does not carry across. Stage a Triton
-ensemble in tree form.
+[Triton declares ensembles](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#ensemble-models)
+in `config.pbtxt` with `platform: "ensemble"` rather than as a graph file, so a
+`.json` ensemble does not carry across — see [Ensembles](#ensembles).
 
 ## TensorRT
 
@@ -282,7 +295,7 @@ These hold on every run, because staging re-runs on every restart:
 tests/test-model-stager.sh
 ```
 
-97 assertions, no GPU, no TensorRT, no server: `trtexec` and the server are
+132 assertions, no GPU, no TensorRT, no server: `trtexec` and the server are
 stubs on `PATH` that record how they were called. What is under test is the
 dispatch and the tree it produces.
 
