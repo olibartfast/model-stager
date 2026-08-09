@@ -1,0 +1,134 @@
+# Stock upstream Triton served from a staged repository.
+#
+# The stager is a real init container: it builds the tree and exits, and Triton
+# is unmodified. No model is named anywhere in this file -- adding or removing
+# one means changing the artifact image, not this manifest.
+#
+#   1. stage-artifacts  copies its exported models into a shared staging volume
+#   2. model-stager     compiles/renames them into a repository tree, then exits
+#   3. tritonserver     mounts the finished tree and serves it
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: triton-model-repo
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tritonserver
+  labels:
+    app: tritonserver
+spec:
+  replicas: 1
+  # A cold TensorRT build takes minutes -- measured at ~8.5 min for a 101 MB
+  # model. The 600s default marks the rollout failed while the init container is
+  # still legitimately working.
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tritonserver
+  template:
+    metadata:
+      labels:
+        app: tritonserver
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        # Step 1: the artifact image stages itself, using its own default
+        # command. Keeping the copy in that image rather than in a command:
+        # here means the identical image works under compose or a bare
+        # docker run.
+        - name: stage-artifacts
+          image: my-models:v1
+          volumeMounts:
+            - {name: staging, mountPath: /staging}
+
+        # Step 2: build the tree and exit.
+        - name: model-stager
+          image: model-stager:trt
+          env:
+            - {name: REPOSITORY_LAYOUT, value: triton}
+            - {name: STAGE_DIR, value: /staging}
+            - {name: MODEL_REPOSITORY, value: /models/repo}
+            - {name: TRT_PRECISION, value: fp16}
+            # Per-model optimization profile for a dynamic model. A static model
+            # in the same repository needs no shape variables at all, which is
+            # why this carries the model-name suffix rather than being global.
+            # - {name: TRT_MIN_SHAPES_RAFT_LARGE, value: "input1:1x3x256x256"}
+            # - {name: TRT_OPT_SHAPES_RAFT_LARGE, value: "input1:1x3x520x960"}
+            # - {name: TRT_MAX_SHAPES_RAFT_LARGE, value: "input1:1x3x1080x1920"}
+          # A TensorRT engine is built against a real device. Init containers run
+          # to completion before the main container starts, so a single-GPU node
+          # is never contended: Kubernetes schedules on max(init, main), not the
+          # sum.
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - {name: staging, mountPath: /staging}
+            - {name: models, mountPath: /models}
+
+      containers:
+        # Step 3: unmodified upstream Triton. It receives a finished repository
+        # and has no idea anything staged it.
+        #
+        # The tag must ship the same TensorRT the stager used -- 25.12 on both
+        # sides here. A mismatch is reported as a version error at load time.
+        - name: tritonserver
+          image: nvcr.io/nvidia/tritonserver:25.12-py3
+          args:
+            - tritonserver
+            - --model-repository=/models/repo
+            - --http-port=8000
+            - --grpc-port=8001
+            - --metrics-port=8002
+          ports:
+            - {name: http, containerPort: 8000}
+            - {name: grpc, containerPort: 8001}
+            - {name: metrics, containerPort: 8002}
+          # Conversion already finished in the init container, so this budget
+          # only has to cover Triton's own model loading.
+          startupProbe:
+            httpGet: {path: /v2/health/ready, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /v2/health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /v2/health/live, port: http}
+            periodSeconds: 20
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+
+      volumes:
+        - name: staging
+          emptyDir: {}
+        # Persisted, not emptyDir: rebuilding engines costs minutes that would
+        # otherwise be paid on every pod replacement, and staging skips a model
+        # that is already built.
+        - name: models
+          persistentVolumeClaim:
+            claimName: triton-model-repo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tritonserver
+spec:
+  selector:
+    app: tritonserver
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+    - {name: grpc, port: 8001, targetPort: grpc}
+    - {name: metrics, port: 8002, targetPort: metrics}

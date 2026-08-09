@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+
+jobs:
+  test:
+    name: Lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck and dash
+        run: sudo apt-get update && sudo apt-get install -y shellcheck dash
+
+      - name: Shellcheck
+        run: shellcheck bin/model-stager tests/test-model-stager.sh
+
+      - name: Tests under bash
+        run: tests/test-model-stager.sh
+
+      # bin/model-stager is POSIX sh, and the container shell is often busybox
+      # ash rather than bash. Running the suite again with dash as /bin/sh keeps
+      # a bashism from passing here and failing inside the image.
+      - name: Tests under dash
+        run: |
+          sudo ln -sf /bin/dash /bin/sh
+          tests/test-model-stager.sh
+
+  manifests:
+    name: Example manifests parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate YAML
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          failed = False
+          for path in sorted(glob.glob('examples/**/*.y*ml', recursive=True)):
+              try:
+                  list(yaml.safe_load_all(open(path)))
+                  print(f'ok   {path}')
+              except Exception as error:
+                  print(f'FAIL {path}: {error}')
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+  image:
+    name: Image builds and stages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The slim base needs no GPU and no TensorRT, so the image path is
+      # exercised on an ordinary runner. Only the trtexec branch is left
+      # uncovered here, and the test suite stubs that.
+      - name: Build slim image
+        run: docker build --build-arg BASE_IMAGE=busybox:glibc -t model-stager:ci .
+
+      - name: Stage a repository through the image
+        run: |
+          set -eu
+          mkdir -p staging repo
+          printf 'ir' > staging/segmenter.xml
+          printf 'weights' > staging/segmenter.bin
+          printf 'onnx' > staging/detector.onnx
+          docker run --rm \
+            -e REPOSITORY_LAYOUT=ovms \
+            -e ONNX_BACKEND=onnx_runtime \
+            -v "$PWD/staging:/staging" \
+            -v "$PWD/repo:/models/repo" \
+            model-stager:ci
+          test -f repo/segmenter/1/model.xml
+          test -f repo/segmenter/1/model.bin
+          test -f repo/detector/1/model.onnx
+          echo "staged tree:"
+          find repo -type f | sort

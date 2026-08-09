@@ -1,0 +1,67 @@
+# The same procedure without Kubernetes.
+#
+# Identical images, identical entrypoints, identical volume layout as
+# examples/kubernetes/triton.yaml. The orchestrator only wires volumes together
+# -- staging lives in the artifact image and repository building lives in the
+# stager image -- so neither step depends on Kubernetes.
+#
+#   docker compose up
+services:
+  # Kubernetes calls this an init container; compose calls it a service that has
+  # to complete first. Same image, same default command.
+  stage-artifacts:
+    image: my-models:v1
+    volumes:
+      - staging:/staging
+
+  model-stager:
+    image: model-stager:trt
+    depends_on:
+      stage-artifacts:
+        condition: service_completed_successfully
+    environment:
+      REPOSITORY_LAYOUT: triton
+      STAGE_DIR: /staging
+      MODEL_REPOSITORY: /models/repo
+      TRT_PRECISION: fp16
+    volumes:
+      - staging:/staging
+      - model-repo:/models/repo
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - {driver: nvidia, count: 1, capabilities: [gpu]}
+
+  tritonserver:
+    image: nvcr.io/nvidia/tritonserver:25.12-py3
+    depends_on:
+      # The stager exits 0 when the tree is ready, which is exactly the signal
+      # Triton needs to start.
+      model-stager:
+        condition: service_completed_successfully
+    command:
+      - tritonserver
+      - --model-repository=/models/repo
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      # Named volume rather than a throwaway: rebuilding engines is expensive,
+      # and staging skips a model that is already built.
+      - model-repo:/models/repo:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - {driver: nvidia, count: 1, capabilities: [gpu]}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/v2/health/ready"]
+      interval: 10s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  staging:
+  model-repo:

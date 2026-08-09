@@ -1,0 +1,26 @@
+name: model-stager
+role: model-repository-staging
+
+default_branches:
+  integration: develop
+  release: master
+
+entrypoints:
+  test:
+    - tests/test-model-stager.sh
+  lint:
+    - shellcheck bin/model-stager tests/test-model-stager.sh
+
+owned_paths:
+  - bin/
+  - tests/
+  - examples/
+  - Dockerfile
+  - AGENTS.md
+
+constraints:
+  # The tool must not gain knowledge of any server's protocol, any model's
+  # tensor names, or any task's semantics. It maps artifacts to filenames.
+  server_neutral: true
+  model_agnostic: true
+  posix_sh_only: true
