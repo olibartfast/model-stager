@@ -572,6 +572,66 @@ expect_file "preprocess/1/model.dali"
 expect_file "yolo_ensemble/1/model.json"
 
 # =============================================================================
+echo "=== Case 25: MODELS selects a subset of the artifact image ==="
+new_case models-subset
+# One artifact image carrying a catalogue; this deployment serves two of it.
+printf 'onnx' >"$STAGE/rfdetr-seg.onnx"
+printf 'onnx' >"$STAGE/yolo26-seg.onnx"
+printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
+printf 'onnx' >"$STAGE/yolo-pose.onnx"
+MODELS="rfdetr-pose,yolo-pose" run_stager
+expect_exit $? 0
+expect_file "rfdetr-pose/1/model.plan"
+expect_file "yolo-pose/1/model.plan"
+expect_absent "rfdetr-seg"
+expect_absent "yolo26-seg"
+# Unselected models must cost nothing: an engine build is minutes.
+if [ "$(wc -l <"$TRTEXEC_LOG")" -eq 2 ]; then
+    pass "$CASE: built only the selected models"
+else
+    fail "$CASE: built $(wc -l <"$TRTEXEC_LOG") engines, expected 2"
+fi
+
+new_case models-spaces
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'onnx' >"$STAGE/b.onnx"
+MODELS="a b" run_stager
+expect_exit $? 0
+expect_file "a/1/model.plan"
+expect_file "b/1/model.plan"
+
+# =============================================================================
+echo "=== Case 26: a requested model that is not staged is an error ==="
+new_case models-missing
+printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
+# Serving three of four looks healthy everywhere except the client that needs
+# the fourth, so a typo or a stale artifact image has to fail here.
+MODELS="rfdetr-pose,yolo-pose" run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "requested but not staged: yolo-pose"
+
+# =============================================================================
+echo "=== Case 27: MODELS unset still stages everything ==="
+new_case models-unset
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'pte' >"$STAGE/b.pte"
+run_stager
+expect_exit $? 0
+expect_file "a/1/model.plan"
+expect_file "b/1/model.pte"
+
+# =============================================================================
+echo "=== Case 28: MODELS selects tree-form models too ==="
+new_case models-tree
+mkdir -p "$STAGE/wanted/1" "$STAGE/unwanted/1"
+printf 'engine' >"$STAGE/wanted/1/model.plan"
+printf 'engine' >"$STAGE/unwanted/1/model.plan"
+MODELS=wanted run_stager
+expect_exit $? 0
+expect_file "wanted/1/model.plan"
+expect_absent "unwanted"
+
+# =============================================================================
 echo
 echo "=== Summary ==="
 echo "passed: $PASS"

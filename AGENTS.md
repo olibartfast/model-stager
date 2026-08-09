@@ -58,7 +58,7 @@ Documentation is read by people who know none of these projects.
 ## Build, Test, and Development Commands
 
 ```bash
-tests/test-model-stager.sh                              # 115 assertions
+tests/test-model-stager.sh                              # 132 assertions
 shellcheck bin/model-stager tests/test-model-stager.sh
 ```
 

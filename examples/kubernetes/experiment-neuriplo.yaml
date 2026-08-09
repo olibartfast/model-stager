@@ -1,96 +1,95 @@
-# Experiment: neuriplo-kserve-runtime serving TensorRT pose models, loaded on
-# demand.
+# Experiment: neuriplo-kserve-runtime, staged repository, client-driven loading.
 #
-# Self-contained and isolated. Its own namespace, its own PVC, its own names --
-# it shares nothing with any other deployment and cannot reconfigure one. In
-# particular it does not touch an existing neuriplo-kserve-runtime elsewhere in
-# the cluster. Apply it, scale it, delete the namespace when finished.
+# Structurally identical to experiment-triton.yaml apart from the server
+# container and REPOSITORY_LAYOUT, which is the point: the tree is the interface.
 #
-#   models    rfdetr-pose, yolo-pose  (names come from the staged filenames)
-#   layout    neuriplo
-#   loading   explicit -- nothing resident until the client asks
+# Model-agnostic. Nothing in this manifest's structure -- names, labels, probes,
+# arguments, volumes, ports -- depends on which models are served. Two knobs, and
+# only two, decide that:
 #
-# Created stopped (replicas: 0). Scale it up when you want to run it; scale it
-# back to 0 when done. On a single-GPU node that means one experiment at a time
-# unless you have configured GPU sharing yourself.
+#   the artifact image     which models exist
+#   MODELS                 which of them this deployment stages
 #
-#   kubectl apply -f experiment-neuriplo-pose.yaml
-#   kubectl -n exp-neuriplo-pose scale deploy/neuriplo-pose --replicas=1
-#   kubectl -n exp-neuriplo-pose logs -f deploy/neuriplo-pose -c model-stager
+# Change either and nothing else here changes. Leave MODELS unset to stage
+# everything the artifact image carries.
+#
+# Self-contained and isolated: its own namespace, PVC, Deployment and Service. It
+# does not touch a neuriplo-kserve-runtime deployed anywhere else in the cluster,
+# and `kubectl delete ns exp-neuriplo` removes it entirely.
+#
+# Created stopped (replicas: 0). Scale up to run, back to 0 when done. On a
+# single-GPU node that means one experiment at a time unless you have configured
+# GPU sharing yourself.
+#
+#   kubectl apply -f experiment-neuriplo.yaml
+#   kubectl -n exp-neuriplo scale deploy/neuriplo --replicas=1
+#   kubectl -n exp-neuriplo logs -f deploy/neuriplo -c model-stager
 #   ...
-#   kubectl -n exp-neuriplo-pose scale deploy/neuriplo-pose --replicas=0
+#   kubectl -n exp-neuriplo scale deploy/neuriplo --replicas=0
 #
-# Requires an artifact image staging rfdetr-pose.onnx and yolo-pose.onnx into
-# /staging with its own CMD, and a model-stager image whose TensorRT version
-# matches the runtime image's. A mismatch builds fine and fails at the client's
-# first load call, not at startup.
+# The stager's TensorRT must match the runtime image's. A mismatch builds fine
+# and fails at the client's first load call, not at startup.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: exp-neuriplo-pose
+  name: exp-neuriplo
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: model-repo
-  namespace: exp-neuriplo-pose
+  namespace: exp-neuriplo
 spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 5Gi
+      storage: 10Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: neuriplo-pose
-  namespace: exp-neuriplo-pose
+  name: neuriplo
+  namespace: exp-neuriplo
   labels:
-    app: neuriplo-pose
+    app: neuriplo
 spec:
   replicas: 0
-  # A cold engine build takes minutes -- ~8.5 min for a 101 MB model on an RTX
-  # 3060 -- and runs in the init container before the server starts. The 600s
-  # default would mark the rollout failed while the stager is still working.
   progressDeadlineSeconds: 1800
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: neuriplo-pose
+      app: neuriplo
   template:
     metadata:
       labels:
-        app: neuriplo-pose
+        app: neuriplo
     spec:
       runtimeClassName: nvidia
       initContainers:
+        # KNOB 1: which models exist.
         - name: stage-artifacts
           image: my-models:pose-v1
           imagePullPolicy: Never
           volumeMounts:
             - {name: staging, mountPath: /staging}
 
-        # Same image as the Triton experiment's stager. Only REPOSITORY_LAYOUT
+        # Same stager image as the Triton experiment. Only REPOSITORY_LAYOUT
         # differs, because the two servers disagree on filenames inside an
         # otherwise identical tree.
         - name: model-stager
           image: model-stager:trt
           imagePullPolicy: Never
           env:
+            # KNOB 2: which of them this deployment serves. Unset stages all.
+            - {name: MODELS, value: "rfdetr-pose,yolo-pose"}
             - {name: REPOSITORY_LAYOUT, value: neuriplo}
             - {name: STAGE_DIR, value: /staging}
             - {name: MODEL_REPOSITORY, value: /models/repo}
             - {name: MODEL_VERSION, value: "1"}
             - {name: TRT_PRECISION, value: fp16}
-            # Set shape variables only for an export with dynamic axes -- trtexec
-            # rejects explicit shapes on a static model outright. A dynamic model
-            # needs all three: a single TRT_SHAPES builds no optimization
-            # profile, producing an engine that cannot accept the range it was
-            # meant to serve.
-            # - {name: TRT_MIN_SHAPES_RFDETR_POSE, value: "input:1x3x432x432"}
-            # - {name: TRT_OPT_SHAPES_RFDETR_POSE, value: "input:1x3x432x432"}
-            # - {name: TRT_MAX_SHAPES_RFDETR_POSE, value: "input:4x3x432x432"}
+            # No shape variables: see experiment-triton.yaml for why they are
+            # per-model and why a global one breaks static exports.
           resources:
             limits:
               nvidia.com/gpu: 1
@@ -125,8 +124,8 @@ spec:
           # on it would leave the Service with no endpoints and no way for a
           # client to ever issue the load that would clear it -- a healthy,
           # unreachable process. /v2/health/live means the control plane is up
-          # and accepting load requests, which is the only useful sense of ready
-          # for a server whose contents are the client's choice.
+          # and accepting load requests, the only useful sense of ready for a
+          # server whose contents are the client's choice.
           startupProbe:
             httpGet: {path: /v2/health/live, port: http}
             periodSeconds: 5
@@ -146,7 +145,6 @@ spec:
       volumes:
         - name: staging
           emptyDir: {}
-        # Persisted so scaling to 0 and back does not rebuild the engines.
         - name: models
           persistentVolumeClaim:
             claimName: model-repo
@@ -154,10 +152,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: neuriplo-pose
-  namespace: exp-neuriplo-pose
+  name: neuriplo
+  namespace: exp-neuriplo
 spec:
   selector:
-    app: neuriplo-pose
+    app: neuriplo
   ports:
     - {name: http, port: 8080, targetPort: http}

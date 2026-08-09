@@ -2,8 +2,8 @@
 
 | File | Scenario |
 |---|---|
-| [kubernetes/experiment-triton-seg.yaml](kubernetes/experiment-triton-seg.yaml) | Triton, TensorRT segmentation models, client-driven loading. |
-| [kubernetes/experiment-neuriplo-pose.yaml](kubernetes/experiment-neuriplo-pose.yaml) | neuriplo-kserve-runtime, TensorRT pose models, client-driven loading. |
+| [kubernetes/experiment-triton.yaml](kubernetes/experiment-triton.yaml) | Triton, staged repository, client-driven loading. |
+| [kubernetes/experiment-neuriplo.yaml](kubernetes/experiment-neuriplo.yaml) | neuriplo-kserve-runtime, same, different layout. |
 | [kubernetes/triton.yaml](kubernetes/triton.yaml) | Minimal single-server Triton, everything loaded at startup. |
 | [kubernetes/ovms.yaml](kubernetes/ovms.yaml) | OpenVINO Model Server, no GPU; staging is copy-and-rename only. |
 | [compose/docker-compose.yml](compose/docker-compose.yml) | The Triton flow without Kubernetes. |
@@ -13,13 +13,32 @@
 Two independent uses of the same stager image, proving the layout switch is the
 only thing that changes between servers:
 
-| | `experiment-triton-seg` | `experiment-neuriplo-pose` |
+| | `experiment-triton` | `experiment-neuriplo` |
 |---|---|---|
-| namespace | `exp-triton-seg` | `exp-neuriplo-pose` |
+| namespace | `exp-triton` | `exp-neuriplo` |
 | server | Triton 25.12 | neuriplo-kserve-runtime |
-| models | `rfdetr-seg`, `yolo26-seg` | `rfdetr-pose`, `yolo-pose` |
 | `REPOSITORY_LAYOUT` | `triton` | `neuriplo` |
 | loading | explicit | explicit |
+
+### Model-agnostic by construction
+
+Nothing in either manifest's *structure* — names, labels, probes, arguments,
+volumes, ports — depends on which models are served. Exactly two lines per file
+name a model:
+
+```yaml
+image: my-models:seg-v1                        # which models exist
+- {name: MODELS, value: "rfdetr-seg,yolo26-seg"}   # which of them this one serves
+```
+
+Change either and nothing else changes. Leave `MODELS` unset and the deployment
+stages everything the artifact image carries, naming no model at all.
+
+That split is what lets one artifact image carry a catalogue while several
+deployments each serve a slice of it. A name in `MODELS` that is not in the
+staging directory is an error, not a smaller repository — serving three of four
+requested models looks healthy from every angle except the client that needs the
+fourth.
 
 **Each is entirely self-contained** — its own namespace, PVC, Deployment and
 Service. Applying one cannot reconfigure the other, and neither can touch a
@@ -31,17 +50,17 @@ back to 0 when finished. On a single-GPU node that is one at a time, unless you
 have configured GPU sharing yourself.
 
 ```bash
-kubectl apply -f kubernetes/experiment-triton-seg.yaml
-kubectl apply -f kubernetes/experiment-neuriplo-pose.yaml
+kubectl apply -f kubernetes/experiment-triton.yaml
+kubectl apply -f kubernetes/experiment-neuriplo.yaml
 
-kubectl -n exp-triton-seg scale deploy/triton-seg --replicas=1
-kubectl -n exp-triton-seg logs -f deploy/triton-seg -c model-stager   # engine build
+kubectl -n exp-triton scale deploy/triton --replicas=1
+kubectl -n exp-triton logs -f deploy/triton -c model-stager   # engine build
 # ... test ...
-kubectl -n exp-triton-seg scale deploy/triton-seg --replicas=0
+kubectl -n exp-triton scale deploy/triton --replicas=0
 
-kubectl -n exp-neuriplo-pose scale deploy/neuriplo-pose --replicas=1
+kubectl -n exp-neuriplo scale deploy/neuriplo --replicas=1
 # ... test ...
-kubectl -n exp-neuriplo-pose scale deploy/neuriplo-pose --replicas=0
+kubectl -n exp-neuriplo scale deploy/neuriplo --replicas=0
 ```
 
 The first scale-up of each builds its engines and takes minutes. The repository
@@ -78,8 +97,8 @@ Both servers speak the same model-repository extension, so the calls differ only
 in address.
 
 ```bash
-SEG=http://triton-seg.exp-triton-seg:8000
-POSE=http://neuriplo-pose.exp-neuriplo-pose:8080
+SEG=http://triton.exp-triton:8000
+POSE=http://neuriplo.exp-neuriplo:8080
 
 # Everything staged, all UNAVAILABLE until asked for.
 curl -X POST $SEG/v2/repository/index

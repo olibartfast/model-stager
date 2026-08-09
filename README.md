@@ -295,7 +295,7 @@ These hold on every run, because staging re-runs on every restart:
 tests/test-model-stager.sh
 ```
 
-115 assertions, no GPU, no TensorRT, no server: `trtexec` and the server are
+132 assertions, no GPU, no TensorRT, no server: `trtexec` and the server are
 stubs on `PATH` that record how they were called. What is under test is the
 dispatch and the tree it produces.
 
