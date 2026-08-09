@@ -4,10 +4,13 @@
 # Server-agnostic and format-general by construction. ONNX, TensorRT, OpenVINO
 # IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI and ensemble graphs mix
 # freely in one repository. The output is a versioned model repository
-# tree -- <model>/<version>/<file> -- which is the layout every KServe-compliant
-# server reads: Triton, OpenVINO Model Server, neuriplo-kserve-runtime. Nothing
-# in here links the tree to the process that will serve it, so one image is an
-# init container in front of any of them.
+# tree -- <model>/<version>/<file> -- the layout introduced by Triton
+# (https://github.com/triton-inference-server/server) and also read by OpenVINO
+# Model Server (https://github.com/openvinotoolkit/model_server). The neuriplo
+# layout targets this author's own runtime
+# (https://github.com/olibartfast/neuriplo-kserve-runtime). Nothing in here links
+# the tree to the process that will serve it, so one image is an init container
+# in front of any of them.
 #
 # By default it stages and exits, which is what an init container should do. Set
 # SERVER_EXEC to have it exec a server afterwards instead; that is only needed
@@ -63,6 +66,14 @@
 #                          dynamic model needs these rather than that.
 #   TRT_EXTRA_ARGS         additional trtexec arguments
 #   TRT_FALLBACK_ONNX      when true, keep the ONNX if trtexec is unavailable
+#   MODELS                 which models to take from STAGE_DIR, comma or space
+#                          separated. Unset means all of them. This is the one
+#                          place a deployment names a model: an artifact image
+#                          can carry a whole catalogue while each deployment
+#                          stages the subset it serves, leaving the manifest
+#                          around it identical whatever is being served. A name
+#                          that is not in STAGE_DIR is an error, not a smaller
+#                          repository.
 #   STAGER_IGNORE_UNKNOWN  when true, skip unrecognized staged files instead of
 #                          failing. Off by default: a silently dropped artifact
 #                          surfaces much later as a 404 from a client.
@@ -82,6 +93,30 @@ ONNX_BACKEND="${ONNX_BACKEND:-tensorrt}"
 TRT_PRECISION="${TRT_PRECISION:-fp16}"
 TRT_FALLBACK_ONNX="${TRT_FALLBACK_ONNX:-false}"
 STAGER_IGNORE_UNKNOWN="${STAGER_IGNORE_UNKNOWN:-false}"
+MODELS="${MODELS:-}"
+
+# Which models to take out of STAGE_DIR. Unset means all of them.
+#
+# This is the one place a deployment names a model. An artifact image can carry a
+# whole catalogue and each deployment stage the subset it serves, so the manifest
+# around it -- names, probes, arguments, volumes -- stays identical whatever is
+# being served. Commas or spaces.
+MODELS_WANTED=$(printf '%s' "$MODELS" | tr ',;' '  ')
+MODELS_FOUND=""
+
+model_selected() {
+    [ -z "$MODELS_WANTED" ] && return 0
+    for model_wanted in $MODELS_WANTED; do
+        if [ "$model_wanted" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+model_mark_found() {
+    MODELS_FOUND="$MODELS_FOUND $1"
+}
 
 case "$ONNX_BACKEND" in
     tensorrt | onnx_runtime) ;;
@@ -171,20 +206,42 @@ model_override() {
 
 # Publishing a whole version directory at once keeps multi-file models (OpenVINO
 # .xml + .bin) atomic, which a per-file rename cannot. A rename within one
-# filesystem is atomic, and the target never exists because a populated version
-# directory short-circuits before we get here.
+# filesystem is atomic.
 publish() {
     publish_staging_dir="$1"
     publish_target_dir="$2"
+    if [ -e "$publish_target_dir" ]; then
+        # `mv a b` moves a *into* b when b is an existing directory, which would
+        # nest a temp directory inside the version rather than replace it, once
+        # per restart. already_staged should have short-circuited before here.
+        echo "error: refusing to publish over an existing $publish_target_dir" >&2
+        rm -rf "$publish_staging_dir"
+        exit 1
+    fi
     mkdir -p "$(dirname "$publish_target_dir")"
     mv "$publish_staging_dir" "$publish_target_dir"
     echo "staged $publish_target_dir"
 }
 
-# True when the version directory already holds something, so a restart against a
-# warm volume neither rebuilds an engine (minutes) nor re-copies a model.
+# True when the version directory exists, so a restart against a warm volume
+# neither rebuilds an engine (minutes) nor re-copies a model.
+#
+# Existence, not non-emptiness: a Triton ensemble's version directory is legally
+# empty -- the model is declared entirely in config.pbtxt -- and treating empty
+# as unstaged made every restart re-stage it. A version directory only ever
+# exists because a publish succeeded; a failed run removes its temp directory and
+# never creates the target.
 already_staged() {
-    [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
+    [ -d "$1" ]
+}
+
+# A Triton ensemble declares itself in config.pbtxt and has no model file. This
+# is how a GPU pre/post-processing pipeline is expressed -- a DALI model decodes
+# and resizes, a TensorRT model infers, and the ensemble wires them -- so
+# recognizing it is what makes those pipelines stageable at all.
+is_ensemble_config() {
+    grep -qE '^[[:space:]]*(platform[[:space:]]*:[[:space:]]*"ensemble"|ensemble_scheduling)' \
+        "$1" 2>/dev/null
 }
 
 convert_onnx() {
@@ -393,7 +450,11 @@ for entry in "$STAGE_DIR"/*; do
     entry_name=$(basename "$entry")
 
     if [ -d "$entry" ]; then
+        if ! model_selected "$entry_name"; then
+            continue
+        fi
         stage_tree "$entry" "$entry_name"
+        model_mark_found "$entry_name"
         staged_any="yes"
         continue
     fi
@@ -403,6 +464,13 @@ for entry in "$STAGE_DIR"/*; do
         *) extension="" ;;
     esac
     model_name="${entry_name%.*}"
+
+    # Checked before the extension is judged, so an artifact image may carry
+    # formats this deployment does not select and does not have to be able to
+    # stage.
+    if ! model_selected "$model_name"; then
+        continue
+    fi
 
     case "$extension" in
         bin)
@@ -420,6 +488,7 @@ for entry in "$STAGE_DIR"/*; do
             ;;
         onnx | plan | engine | xml | pte | tflite | torchscript | pt | pb | dali | json)
             stage_flat "$entry" "$model_name" "$extension"
+            model_mark_found "$model_name"
             staged_any="yes"
             ;;
         *)
@@ -437,13 +506,60 @@ done
 for entry in "$STAGE_DIR"/*.pbtxt; do
     [ -f "$entry" ] || continue
     model_name=$(basename "$entry" .pbtxt)
+
     if [ ! -d "$MODEL_REPOSITORY/$model_name" ]; then
+        # An ensemble has no model file of its own: the graph lives entirely in
+        # config.pbtxt and the version directory is legally empty. So a config
+        # with no model beside it is a whole model when it declares an ensemble,
+        # and an orphaned overlay -- almost always a basename typo -- otherwise.
+        if is_ensemble_config "$entry"; then
+            ensemble_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
+            mkdir -p "$ensemble_dir"
+            cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
+            echo "staged ensemble $MODEL_REPOSITORY/$model_name (version $MODEL_VERSION empty by design)"
+            staged_any="yes"
+            continue
+        fi
         echo "error: $entry has no matching model in the repository" >&2
+        echo "       a config for a model that is not staged is usually a" >&2
+        echo "       basename mismatch; an ensemble needs platform: \"ensemble\"" >&2
         exit 1
     fi
+
     cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
     echo "applied config overlay $MODEL_REPOSITORY/$model_name/config.pbtxt"
+    # The model this configures is in the repository, so the run produced
+    # something servable. Without this, a restart whose staging directory holds
+    # only an ensemble config -- already staged, so nothing new is written --
+    # would report an empty repository and refuse to start.
+    staged_any="yes"
 done
+
+# A requested model that was not in STAGE_DIR is an error, not a smaller
+# repository. Serving three of the four models a deployment asked for looks
+# healthy from every angle except the one client that needs the fourth, and it
+# fails as a 404 long after the artifact image that lacked it was built.
+if [ -n "$MODELS_WANTED" ]; then
+    models_missing=""
+    for model_wanted in $MODELS_WANTED; do
+        model_seen=""
+        for model_found in $MODELS_FOUND; do
+            if [ "$model_found" = "$model_wanted" ]; then
+                model_seen="yes"
+                break
+            fi
+        done
+        if [ -z "$model_seen" ]; then
+            models_missing="$models_missing $model_wanted"
+        fi
+    done
+    if [ -n "$models_missing" ]; then
+        echo "error: MODELS requested but not staged:$models_missing" >&2
+        echo "       staged directory holds:" >&2
+        ls -1 "$STAGE_DIR" >&2 || true
+        exit 1
+    fi
+fi
 
 if [ -z "$staged_any" ]; then
     # An empty repository is indistinguishable from a broken volume mount, so
