@@ -1,0 +1,9 @@
+# Staged artifacts and built repositories are outputs, never sources.
+staging/
+repo/
+*.onnx
+*.plan
+*.engine
+*.pte
+*.tflite
+*.dali

@@ -1,0 +1,468 @@
+#!/bin/sh
+# model-stager -- build a model repository tree from staged artifacts.
+#
+# Server-agnostic by construction. The output is a versioned model repository
+# tree -- <model>/<version>/<file> -- which is the layout every KServe-compliant
+# server reads: Triton, OpenVINO Model Server, neuriplo-kserve-runtime. Nothing
+# in here links the tree to the process that will serve it, so one image is an
+# init container in front of any of them.
+#
+# By default it stages and exits, which is what an init container should do. Set
+# SERVER_EXEC to have it exec a server afterwards instead; that is only needed
+# when the build must happen inside the serving container itself, which is the
+# case for TensorRT -- an engine is specific to the GPU, driver, and TensorRT
+# version that built it, so it cannot be built at image build time or on the
+# host, and the builder's TensorRT must match the server's.
+#
+# Nothing here names a model. Each model's name comes from its staged filename
+# (or directory), and the backend that serves it comes from the filename this
+# script writes. See README.md for the full specification.
+#
+# Staging shapes accepted under STAGE_DIR:
+#
+#   flat   <name>.<ext>              -> <name>/<version>/<layout filename>
+#          <name>.pbtxt              -> <name>/config.pbtxt
+#          <name>.bin                companion of <name>.xml (OpenVINO weights)
+#
+#   tree   <name>/<version>/...      -> copied through verbatim
+#
+# Tree form is the escape hatch: it is copied without interpretation, so a model
+# needing an exact layout, extra files, or a version other than MODEL_VERSION can
+# express it directly instead of this script growing a config language.
+#
+# Environment:
+#   STAGE_DIR              directory the artifacts were staged into
+#                          (default /staging)
+#   MODEL_REPOSITORY       repository root to build (default /models/repo)
+#   MODEL_VERSION          version directory for flat-form artifacts (default 1)
+#   REPOSITORY_LAYOUT      filename convention of the server that will read the
+#                          tree (default triton): neuriplo | triton | ovms.
+#                          Servers agree on <model>/<version>/ but not on what
+#                          the file inside is called -- Triton wants a
+#                          TorchScript at model.pt and a frozen graph at
+#                          model.graphdef -- and a name the server does not
+#                          recognize is a model it silently never loads.
+#   SERVER_EXEC            when set, exec this command after staging, word-split,
+#                          with the container's own arguments appended. Unset
+#                          means stage and exit, which is the normal init
+#                          container behaviour.
+#   ONNX_BACKEND           what a staged .onnx becomes (default tensorrt):
+#                            tensorrt     - compile to a TensorRT engine
+#                            onnx_runtime - copy as ONNX, no compilation
+#   TRT_PRECISION          fp16 (default), fp32, or best
+#   TRT_SHAPES             single trtexec shape spec, e.g.
+#                          images:1x3x768x768. Leave unset for a static ONNX --
+#                          trtexec rejects explicit shapes on a static model with
+#                          "Static model does not take explicit shapes".
+#   TRT_MIN_SHAPES         optimization profile bounds for a model with dynamic
+#   TRT_OPT_SHAPES         axes, e.g. input:1x3x256x256 / input:1x3x520x960 /
+#   TRT_MAX_SHAPES         input:1x3x1080x1920. All three are required together;
+#                          a single TRT_SHAPES does not build a profile, so a
+#                          dynamic model needs these rather than that.
+#   TRT_EXTRA_ARGS         additional trtexec arguments
+#   TRT_FALLBACK_ONNX      when true, keep the ONNX if trtexec is unavailable
+#   STAGER_IGNORE_UNKNOWN  when true, skip unrecognized staged files instead of
+#                          failing. Off by default: a silently dropped artifact
+#                          surfaces much later as a 404 from a client.
+#
+# Per-model overrides. A heterogeneous repository can hold one static and one
+# dynamic model, which a single global shape setting cannot express. Append the
+# model name uppercased with non-alphanumerics replaced by underscores:
+#   TRT_MIN_SHAPES_RAFT_LARGE=...  TRT_PRECISION_YOLO26N_DEPTH=fp32
+set -eu
+
+STAGE_DIR="${STAGE_DIR:-/staging}"
+MODEL_REPOSITORY="${MODEL_REPOSITORY:-/models/repo}"
+MODEL_VERSION="${MODEL_VERSION:-1}"
+REPOSITORY_LAYOUT="${REPOSITORY_LAYOUT:-triton}"
+SERVER_EXEC="${SERVER_EXEC:-}"
+ONNX_BACKEND="${ONNX_BACKEND:-tensorrt}"
+TRT_PRECISION="${TRT_PRECISION:-fp16}"
+TRT_FALLBACK_ONNX="${TRT_FALLBACK_ONNX:-false}"
+STAGER_IGNORE_UNKNOWN="${STAGER_IGNORE_UNKNOWN:-false}"
+
+case "$ONNX_BACKEND" in
+    tensorrt | onnx_runtime) ;;
+    *)
+        echo "error: unsupported ONNX_BACKEND: $ONNX_BACKEND (tensorrt|onnx_runtime)" >&2
+        exit 1
+        ;;
+esac
+
+case "$REPOSITORY_LAYOUT" in
+    neuriplo | triton | ovms) ;;
+    *)
+        echo "error: unsupported REPOSITORY_LAYOUT: $REPOSITORY_LAYOUT" >&2
+        echo "       supported: neuriplo, triton, ovms" >&2
+        exit 1
+        ;;
+esac
+
+# Filename a staged artifact must have for REPOSITORY_LAYOUT's server to load
+# it, or empty when that server cannot serve the format at all. Refusing early
+# beats writing a file the server will never look at: an unsupported format
+# otherwise shows up as a model that is simply missing, with nothing logged.
+target_filename() {
+    case "$REPOSITORY_LAYOUT" in
+        neuriplo)
+            case "$1" in
+                plan) echo "model.plan" ;;
+                onnx) echo "model.onnx" ;;
+                xml) echo "model.xml" ;;
+                torchscript) echo "model.torchscript" ;;
+                pt) echo "model.pt" ;;
+                pb) echo "model.pb" ;;
+                pte) echo "model.pte" ;;
+                tflite) echo "model.tflite" ;;
+                dali) echo "model.dali" ;;
+                json) echo "model.json" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        triton)
+            # Triton's platform detection is filename-driven: model.pt for
+            # TorchScript and model.graphdef for a frozen graph, whatever the
+            # staged extension was.
+            case "$1" in
+                plan) echo "model.plan" ;;
+                onnx) echo "model.onnx" ;;
+                xml) echo "model.xml" ;;
+                torchscript | pt) echo "model.pt" ;;
+                pb) echo "model.graphdef" ;;
+                dali) echo "model.dali" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        ovms)
+            # OpenVINO Model Server serves IR and ONNX. A TensorRT engine is not
+            # something it can load at all.
+            case "$1" in
+                xml) echo "model.xml" ;;
+                onnx) echo "model.onnx" ;;
+                pb) echo "model.pb" ;;
+                *) echo "" ;;
+            esac
+            ;;
+    esac
+}
+
+if [ ! -d "$STAGE_DIR" ]; then
+    echo "error: staging directory not found: $STAGE_DIR" >&2
+    exit 1
+fi
+
+# Value of <prefix>_<MODEL> if set, else the value of <prefix>. Lets one model in
+# a mixed repository override a global without the manifest naming models.
+model_override() {
+    override_prefix="$1"
+    override_model="$2"
+    override_key=$(printf '%s' "$override_model" | tr '[:lower:]' '[:upper:]' |
+        sed 's/[^A-Z0-9]/_/g')
+    eval "override_value=\${${override_prefix}_${override_key}:-}"
+    if [ -n "$override_value" ]; then
+        printf '%s' "$override_value"
+        return 0
+    fi
+    eval "override_value=\${${override_prefix}:-}"
+    printf '%s' "$override_value"
+}
+
+# Publishing a whole version directory at once keeps multi-file models (OpenVINO
+# .xml + .bin) atomic, which a per-file rename cannot. A rename within one
+# filesystem is atomic, and the target never exists because a populated version
+# directory short-circuits before we get here.
+publish() {
+    publish_staging_dir="$1"
+    publish_target_dir="$2"
+    mkdir -p "$(dirname "$publish_target_dir")"
+    mv "$publish_staging_dir" "$publish_target_dir"
+    echo "staged $publish_target_dir"
+}
+
+# True when the version directory already holds something, so a restart against a
+# warm volume neither rebuilds an engine (minutes) nor re-copies a model.
+already_staged() {
+    [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]
+}
+
+convert_onnx() {
+    convert_source="$1"
+    convert_target="$2"
+    convert_model="$3"
+
+    convert_precision=$(model_override TRT_PRECISION "$convert_model")
+    convert_shapes=$(model_override TRT_SHAPES "$convert_model")
+    convert_extra=$(model_override TRT_EXTRA_ARGS "$convert_model")
+    convert_min=$(model_override TRT_MIN_SHAPES "$convert_model")
+    convert_opt=$(model_override TRT_OPT_SHAPES "$convert_model")
+    convert_max=$(model_override TRT_MAX_SHAPES "$convert_model")
+
+    # A model with dynamic axes needs an optimization profile, and a profile is
+    # min/opt/max together. --shapes alone sets one inference shape and builds no
+    # profile, so it is not a shorthand for these -- passing it where a profile
+    # was meant produces an engine that cannot accept the shapes it was supposed
+    # to serve.
+    convert_profile=""
+    if [ -n "$convert_min" ] || [ -n "$convert_opt" ] || [ -n "$convert_max" ]; then
+        if [ -z "$convert_min" ] || [ -z "$convert_opt" ] || [ -z "$convert_max" ]; then
+            echo "error: $convert_model needs TRT_MIN_SHAPES, TRT_OPT_SHAPES and" >&2
+            echo "       TRT_MAX_SHAPES together; a partial profile is not valid" >&2
+            exit 1
+        fi
+        if [ -n "$convert_shapes" ]; then
+            echo "error: $convert_model sets both TRT_SHAPES and a min/opt/max profile" >&2
+            echo "       use the profile for a dynamic model, TRT_SHAPES for a fixed one" >&2
+            exit 1
+        fi
+        convert_profile="yes"
+    fi
+
+    echo "converting $convert_source -> $convert_target (precision=$convert_precision)"
+
+    set -- --onnx="$convert_source" --saveEngine="$convert_target"
+    case "$convert_precision" in
+        fp16) set -- "$@" --fp16 ;;
+        best) set -- "$@" --best ;;
+        fp32) ;;
+        *)
+            echo "error: unsupported TRT precision for $convert_model: $convert_precision" >&2
+            exit 1
+            ;;
+    esac
+    if [ -n "$convert_profile" ]; then
+        set -- "$@" --minShapes="$convert_min" --optShapes="$convert_opt" \
+            --maxShapes="$convert_max"
+    elif [ -n "$convert_shapes" ]; then
+        set -- "$@" --shapes="$convert_shapes"
+    fi
+    if [ -n "$convert_extra" ]; then
+        # Intentionally unquoted: TRT_EXTRA_ARGS carries multiple arguments.
+        # shellcheck disable=SC2086
+        set -- "$@" $convert_extra
+    fi
+
+    trtexec "$@"
+}
+
+# Refuses a format the target server cannot load, naming the layout, so the
+# failure is a startup error rather than a model that never appears.
+#
+# Sets RESOLVED_TARGET rather than echoing it. `t=$(resolve_target ...)` would
+# also work today -- the `exit` leaves only the subshell, but set -e then sees
+# the assignment's non-zero status and stops the script. That is a lot of load
+# for one implicit rule to carry: wrap the call in an `if`, or add a `local` in
+# front of it under bash, and set -e stops applying while the code still looks
+# correct. Assigning directly fails the same way with none of that.
+RESOLVED_TARGET=""
+resolve_target() {
+    RESOLVED_TARGET=$(target_filename "$1")
+    if [ -z "$RESOLVED_TARGET" ]; then
+        echo "error: layout '$REPOSITORY_LAYOUT' cannot serve a .$1 model ($2)" >&2
+        exit 1
+    fi
+}
+
+# Dispatch on the staged artifact's extension. The filename this writes is the
+# whole backend declaration -- every supported server infers the backend from it,
+# so nothing downstream restates the choice.
+stage_flat() {
+    source_file="$1"
+    model_name="$2"
+    extension="$3"
+
+    target_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
+    if already_staged "$target_dir"; then
+        echo "already staged, skipping: $target_dir"
+        return 0
+    fi
+
+    # Resolved before any work is done, so an unsupported format cannot leave a
+    # temp directory behind.
+    case "$extension" in
+        onnx)
+            if [ "$ONNX_BACKEND" = "onnx_runtime" ] || ! command -v trtexec >/dev/null 2>&1; then
+                resolve_target onnx "$model_name"
+            else
+                resolve_target plan "$model_name"
+            fi
+            ;;
+        engine) resolve_target plan "$model_name" ;;
+        *) resolve_target "$extension" "$model_name" ;;
+    esac
+    target_name="$RESOLVED_TARGET"
+
+    work_dir="$MODEL_REPOSITORY/$model_name/.stager-tmp.$MODEL_VERSION.$$"
+    rm -rf "$work_dir"
+    mkdir -p "$work_dir"
+
+    case "$extension" in
+        onnx)
+            if [ "$ONNX_BACKEND" = "onnx_runtime" ]; then
+                cp "$source_file" "$work_dir/$target_name"
+            elif command -v trtexec >/dev/null 2>&1; then
+                convert_onnx "$source_file" "$work_dir/$target_name" "$model_name"
+            elif [ "$TRT_FALLBACK_ONNX" = "true" ]; then
+                # Explicitly opted into: serving the ONNX is a different
+                # execution path with different latency, so it is never a silent
+                # substitution.
+                echo "warning: trtexec not found; TRT_FALLBACK_ONNX=true, serving ONNX" >&2
+                cp "$source_file" "$work_dir/$target_name"
+            else
+                echo "error: trtexec not found in PATH and TRT_FALLBACK_ONNX is not true" >&2
+                echo "       set ONNX_BACKEND=onnx_runtime to serve $model_name without a build" >&2
+                rm -rf "$work_dir"
+                exit 1
+            fi
+            ;;
+        plan | engine)
+            # A prebuilt engine is only valid if it was built on this node; taken
+            # at face value because the alternative is refusing an artifact the
+            # operator deliberately staged.
+            cp "$source_file" "$work_dir/$target_name"
+            ;;
+        xml)
+            # OpenVINO resolves weights by basename, so the .bin has to be
+            # renamed alongside the .xml or the model loads without weights.
+            cp "$source_file" "$work_dir/$target_name"
+            companion="${source_file%.xml}.bin"
+            if [ -f "$companion" ]; then
+                cp "$companion" "$work_dir/${target_name%.xml}.bin"
+            else
+                echo "error: $source_file has no matching .bin weights file" >&2
+                rm -rf "$work_dir"
+                exit 1
+            fi
+            ;;
+        *)
+            cp "$source_file" "$work_dir/$target_name"
+            ;;
+    esac
+
+    publish "$work_dir" "$target_dir"
+}
+
+# Tree form is already repository-shaped, so it is copied without interpretation.
+stage_tree() {
+    source_dir="$1"
+    model_name="$2"
+
+    tree_staged=""
+    for version_dir in "$source_dir"/*; do
+        [ -d "$version_dir" ] || continue
+        version_name=$(basename "$version_dir")
+
+        target_dir="$MODEL_REPOSITORY/$model_name/$version_name"
+        if already_staged "$target_dir"; then
+            echo "already staged, skipping: $target_dir"
+            tree_staged="yes"
+            continue
+        fi
+
+        work_dir="$MODEL_REPOSITORY/$model_name/.stager-tmp.$version_name.$$"
+        rm -rf "$work_dir"
+        mkdir -p "$work_dir"
+        cp -R "$version_dir/." "$work_dir/"
+        publish "$work_dir" "$target_dir"
+        tree_staged="yes"
+    done
+
+    # A config.pbtxt sits beside the version directories, not inside one.
+    if [ -f "$source_dir/config.pbtxt" ]; then
+        mkdir -p "$MODEL_REPOSITORY/$model_name"
+        cp "$source_dir/config.pbtxt" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
+    fi
+
+    if [ -z "$tree_staged" ]; then
+        echo "error: staged directory has no version subdirectory: $source_dir" >&2
+        exit 1
+    fi
+}
+
+# Leftovers from a run killed partway through. Removed before anything is
+# scanned so a half-written directory can never be published by a later pass.
+if [ -d "$MODEL_REPOSITORY" ]; then
+    find "$MODEL_REPOSITORY" -maxdepth 2 -type d -name '.stager-tmp.*' -exec rm -rf {} + 2>/dev/null || true
+fi
+
+staged_any=""
+
+for entry in "$STAGE_DIR"/*; do
+    [ -e "$entry" ] || continue
+    entry_name=$(basename "$entry")
+
+    if [ -d "$entry" ]; then
+        stage_tree "$entry" "$entry_name"
+        staged_any="yes"
+        continue
+    fi
+
+    case "$entry_name" in
+        *.*) extension="${entry_name##*.}" ;;
+        *) extension="" ;;
+    esac
+    model_name="${entry_name%.*}"
+
+    case "$extension" in
+        bin)
+            # Handled with its .xml. An orphan is an error for the same reason
+            # the repository scanner refuses one: a weight blob is not a model.
+            if [ -f "${entry%.bin}.xml" ]; then
+                continue
+            fi
+            echo "error: $entry is an OpenVINO weights file with no matching .xml" >&2
+            exit 1
+            ;;
+        pbtxt)
+            # Copied after its model so it lands beside the version directory.
+            continue
+            ;;
+        onnx | plan | engine | xml | pte | tflite | torchscript | pt | pb | dali | json)
+            stage_flat "$entry" "$model_name" "$extension"
+            staged_any="yes"
+            ;;
+        *)
+            if [ "$STAGER_IGNORE_UNKNOWN" = "true" ]; then
+                echo "ignoring unrecognized staged file: $entry"
+                continue
+            fi
+            echo "error: unrecognized staged file: $entry" >&2
+            echo "       set STAGER_IGNORE_UNKNOWN=true to skip it" >&2
+            exit 1
+            ;;
+    esac
+done
+
+for entry in "$STAGE_DIR"/*.pbtxt; do
+    [ -f "$entry" ] || continue
+    model_name=$(basename "$entry" .pbtxt)
+    if [ ! -d "$MODEL_REPOSITORY/$model_name" ]; then
+        echo "error: $entry has no matching model in the repository" >&2
+        exit 1
+    fi
+    cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
+    echo "applied config overlay $MODEL_REPOSITORY/$model_name/config.pbtxt"
+done
+
+if [ -z "$staged_any" ]; then
+    # An empty repository is indistinguishable from a broken volume mount, so
+    # refuse rather than hand a server nothing to serve.
+    echo "error: no servable artifacts staged in $STAGE_DIR" >&2
+    ls -l "$STAGE_DIR" >&2 || true
+    exit 1
+fi
+
+echo "staged repository $MODEL_REPOSITORY for layout $REPOSITORY_LAYOUT"
+
+if [ -z "$SERVER_EXEC" ]; then
+    # The default, and what an init container should do: the tree is the whole
+    # deliverable, and whichever server mounts the volume next is none of this
+    # tool's business.
+    exit 0
+fi
+
+# exec so the server inherits PID 1's signals and exit code, and so nothing of
+# this script stays resident behind it.
+echo "starting server: $SERVER_EXEC"
+# Intentionally unquoted: SERVER_EXEC is a command line, not a single word.
+# shellcheck disable=SC2086
+exec $SERVER_EXEC "$@"
