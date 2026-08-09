@@ -1,7 +1,9 @@
 #!/bin/sh
 # model-stager -- build a model repository tree from staged artifacts.
 #
-# Server-agnostic by construction. The output is a versioned model repository
+# Server-agnostic and format-general by construction. ONNX, TensorRT, OpenVINO
+# IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI and ensemble graphs mix
+# freely in one repository. The output is a versioned model repository
 # tree -- <model>/<version>/<file> -- which is the layout every KServe-compliant
 # server reads: Triton, OpenVINO Model Server, neuriplo-kserve-runtime. Nothing
 # in here links the tree to the process that will serve it, so one image is an
