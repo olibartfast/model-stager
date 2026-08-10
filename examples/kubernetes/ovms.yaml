@@ -1,93 +1,46 @@
-# OpenVINO Model Server served from a staged repository.
-#
-# The same procedure as triton.yaml with two differences: REPOSITORY_LAYOUT is
-# ovms, and no GPU is requested -- OVMS serves OpenVINO IR and ONNX, neither of
-# which is compiled per-node, so staging here is only copying and renaming.
-#
-# That also means the slim stager image is enough:
-#
-#   docker build --build-arg BASE_IMAGE=busybox:glibc -t model-stager:slim .
-#
-# Staging a TensorRT engine for this layout is refused up front, since OVMS
-# cannot load one and a file it does not recognize is a model it never mentions.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ovms-model-repo
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 2Gi
----
+# OpenVINO Model Server
+# (https://github.com/openvinotoolkit/model_server) reading the same neutral
+# staging contract with its own filename capabilities selected by the layout.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ovms
-  labels:
-    app: ovms
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
-    matchLabels:
-      app: ovms
+    matchLabels: {app: ovms}
   template:
     metadata:
-      labels:
-        app: ovms
+      labels: {app: ovms}
     spec:
       initContainers:
         - name: stage-artifacts
-          image: my-models:openvino-v1
+          image: your-registry/model-artifacts:latest
           volumeMounts:
             - {name: staging, mountPath: /staging}
-
         - name: model-stager
-          image: model-stager:slim
+          image: your-registry/model-stager:latest
           env:
-            - {name: REPOSITORY_LAYOUT, value: ovms}
             - {name: STAGE_DIR, value: /staging}
-            - {name: MODEL_REPOSITORY, value: /models/repo}
-            # Nothing is compiled for this layout, so a staged .onnx is copied
-            # rather than sent to a trtexec that is not in this image.
-            - {name: ONNX_BACKEND, value: onnx_runtime}
+            - {name: MODELS, value: "model-a,model-b"}
+            - {name: MODEL_REPOSITORY, value: /model_repository}
+            - {name: REPOSITORY_LAYOUT, value: ovms}
           volumeMounts:
-            - {name: staging, mountPath: /staging}
-            - {name: models, mountPath: /models}
-
+            - {name: staging, mountPath: /staging, readOnly: true}
+            - {name: repository, mountPath: /model_repository}
       containers:
         - name: ovms
           image: openvino/model_server:latest
-          args:
-            - --model_repository_path=/models/repo
-            - --port=9000
-            - --rest_port=8000
+          args: [--model_repository_path=/model_repository, --port=9000]
           ports:
             - {name: grpc, containerPort: 9000}
-            - {name: http, containerPort: 8000}
-          readinessProbe:
-            httpGet: {path: /v2/health/ready, port: http}
-            periodSeconds: 5
-          livenessProbe:
-            httpGet: {path: /v2/health/live, port: http}
-            periodSeconds: 20
           volumeMounts:
-            - {name: models, mountPath: /models, readOnly: true}
-
+            - {name: repository, mountPath: /model_repository, readOnly: true}
       volumes:
         - name: staging
           emptyDir: {}
-        - name: models
+        - name: repository
           persistentVolumeClaim:
-            claimName: ovms-model-repo
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ovms
-spec:
-  selector:
-    app: ovms
-  ports:
-    - {name: http, port: 8000, targetPort: http}
-    - {name: grpc, port: 9000, targetPort: grpc}
+            claimName: model-repository
