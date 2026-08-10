@@ -1,311 +1,257 @@
 # model-stager
 
-Server-neutral, format-general model repository staging for Kubernetes inference
-workloads.
+`model-stager` maps local model artifacts into a versioned repository and exits.
+It is model-agnostic, task-agnostic, and neutral about the process that serves
+the result.
 
-Turns a directory of heterogeneous model artifacts into a versioned model
-repository tree, then gets out of the way:
+The `<model>/<version>/<file>` tree was introduced by
+[NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server).
+[OpenVINO Model Server](https://github.com/openvinotoolkit/model_server) also
+reads compatible trees for the formats it supports.
 
-```
-/staging/detector.onnx          →   detector/1/model.plan       (compiled)
-/staging/classifier.tflite      →   classifier/1/model.tflite
-/staging/segmenter.xml + .bin   →   segmenter/1/model.xml + .bin
-/staging/pose.torchscript       →   pose/1/model.pt
-/staging/ecdet.pte              →   ecdet/1/model.pte
-/staging/preprocess.dali        →   preprocess/1/model.dali
-```
+`bin/model-stager` is the whole tool. It does not download remote URIs, select a
+serving runtime, inspect tensors, or interpret task metadata.
 
-ONNX, TensorRT, OpenVINO IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI
-and ensemble graphs — mixed freely in one repository, each landing under the
-filename its target server recognizes.
+## Input contracts
 
-`<model>/<version>/<file>` is the
-[model repository layout](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_repository.md)
-introduced by [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server)
-and also read by [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server).
-Nothing here links the tree to the process that serves it, so one image is an
-init container in front of either.
+The stager accepts local inputs in two mutually exclusive modes.
 
-A third layout, `neuriplo`, targets
-[neuriplo-kserve-runtime](https://github.com/olibartfast/neuriplo-kserve-runtime)
-— my own [KServe v2](https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/)
-runtime, and the project this tool was extracted from. It is here because that
-is what I deploy; it is not a convention anyone else uses.
+### Catalog mode: `STAGE_DIR` plus `MODELS`
 
-- [Why a staging step exists](#why-a-staging-step-exists)
-- [Quick start](#quick-start)
-- [Staging shapes](#staging-shapes)
-- [The dispatch](#the-dispatch)
-- [Layouts](#layouts)
-- [TensorRT](#tensorrt)
-- [Configuration](#configuration)
-- [Guarantees](#guarantees)
-- [Failure modes](#failure-modes)
-- [Development](#development)
+`STAGE_DIR` may mix flat artifacts and repository-shaped model directories:
 
-## Why a staging step exists
-
-**Exported artifacts are not repository artifacts.** An exporter writes
-`yolo26n.onnx`, `raft.torchscript`, `ecdet.pte`. A server wants
-`yolo26n/1/model.onnx`, and it wants the TorchScript at `model.pt` if it is
-Triton and refuses it entirely if it is OVMS. Something has to map one to the
-other, and hand-writing that mapping per model is what makes deployments
-model-specific.
-
-**Some artifacts cannot be shipped at all.** A TensorRT engine is compiled
-against a specific GPU, driver, and TensorRT version; one built in CI, on a
-laptop, or in a `docker build` layer will not load on the cluster node. So for
-that format the artifact you ship cannot be the artifact you serve, and the
-conversion has to happen on the node, at deploy time.
-
-The first reason applies to every format and is why this is a general tool. The
-second applies to one and is why it needs to run where it runs. Portable formats
-go through the same path as a copy, so there is one staging procedure rather
-than two.
-
-## Quick start
-
-As a Kubernetes init container in front of stock
-[Triton](https://github.com/triton-inference-server/server):
-
-```yaml
-initContainers:
-  - name: stage-models
-    image: model-stager:trt
-    env:
-      - {name: REPOSITORY_LAYOUT, value: triton}
-    resources: {limits: {nvidia.com/gpu: 1}}
-    volumeMounts:
-      - {name: staging, mountPath: /staging}
-      - {name: models,  mountPath: /models}
-containers:
-  - name: tritonserver
-    image: nvcr.io/nvidia/tritonserver:25.12-py3
-    args: [tritonserver, --model-repository=/models/repo]
-    volumeMounts:
-      - {name: models, mountPath: /models, readOnly: true}
+```text
+/staging/model-a.onnx
+/staging/model-a.pbtxt
+/staging/model-b.xml
+/staging/model-b.bin
+/staging/model-c/3/model.plan
+/staging/model-c/config.pbtxt
 ```
 
-Full manifests in [examples/kubernetes](examples/kubernetes); the same flow
-without Kubernetes in [examples/compose](examples/compose).
+`MODELS=model-a,model-c` stages exactly that subset. An unselected artifact or
+config is ignored; a requested name that is absent is an error. With `MODELS`
+unset, every recognized model is staged. Names use letters, digits, dots,
+underscores, and hyphens; hidden catalog entries are errors unless
+`STAGER_IGNORE_UNKNOWN=true`.
 
-Locally, with no container at all:
+Selection is literal, not dependency resolution. In particular, selecting a
+config-only ensemble does not automatically select the models referenced by its
+graph. The operator's list must include the complete serving set.
+
+A complete existing repository can be mounted as `STAGE_DIR`. Each child model
+directory is selected and copied verbatim. When source and destination are the
+same directory, an unfiltered run validates the repository in place; filtering
+in place is refused because the unselected directories would remain visible.
+
+A mounted single-model directory has numeric version directories directly at
+its root. Its name is supplied through the one-entry list:
 
 ```bash
-STAGE_DIR=./exports MODEL_REPOSITORY=./repo REPOSITORY_LAYOUT=triton \
-  bin/model-stager
+STAGE_DIR=/input/model \
+MODELS=model-a \
+MODEL_REPOSITORY=/model_repository \
+bin/model-stager
 ```
 
-## Staging shapes
+### Explicit mode: `MODEL_INPUTS`
 
-Two are accepted, and a staging directory may mix them.
+Independent local inputs use newline-separated `name=path` records:
 
-**Flat** — one file per model. The filename is the model name.
-
-```
-/staging/detector.onnx        →  detector/1/model.plan
-/staging/ecdet.pte            →  ecdet/1/model.pte
-/staging/segmenter.xml        →  segmenter/1/model.xml
-/staging/segmenter.bin        →  segmenter/1/model.bin
-/staging/ecdet.pbtxt          →  ecdet/config.pbtxt
+```bash
+MODEL_INPUTS='model-a=/mnt/input/model-a.onnx
+model-b=/mnt/repository/model-b' \
+REPOSITORY_LAYOUT=triton \
+MODEL_REPOSITORY=/model_repository \
+bin/model-stager
 ```
 
-**Tree** — already repository-shaped, copied through without interpretation.
+Each path must be either one recognized flat artifact or one repository-shaped
+model directory. A flat artifact also carries a same-basename sibling
+`config.pbtxt` when present. Names must be unique.
 
-```
-/staging/raft/3/model.plan    →  raft/3/model.plan
-/staging/raft/3/labels.txt    →  raft/3/labels.txt
-/staging/raft/config.pbtxt    →  raft/config.pbtxt
-```
+`MODEL_INPUTS` and `MODELS` cannot be set together. This is deliberate:
+explicit paths and catalog selection are separate, auditable input contracts;
+the stager does not merge an implicit catalog with explicit records.
 
-Tree form is the escape hatch. A model needing an exact layout, extra files
-beside it, or several versions at once expresses that directly, instead of this
-tool growing a configuration language to describe the same thing indirectly.
+Directory recognition is structural: numeric version directories plus an
+optional `config.pbtxt`. Unexpected hidden entries at that model root are
+refused by default and ignored when `STAGER_IGNORE_UNKNOWN=true`; files inside
+numeric version directories, including dotfiles, are copied verbatim. Ambiguous
+directories fail rather than being guessed
+as a backend-specific model.
 
-## The dispatch
+The config remains opaque except for an optional top-level `name:` consistency
+check. If present, that name must match the destination directory; the stager
+never rewrites it. Configs belong to the model directory rather than a numbered
+version and may be updated independently; each update is published atomically.
 
-| Staged | Becomes | Action |
-|---|---|---|
-| `.onnx` | engine | [`trtexec`](https://github.com/NVIDIA/TensorRT/tree/main/samples/trtexec) compile — or copied, with `ONNX_BACKEND=onnx_runtime` |
-| `.plan`, `.engine` | engine | copy — a prebuilt engine, valid only if built on this node |
-| `.xml` | IR pair | copy `.xml` **and** rename its `.bin` to match |
-| `.pte`, `.tflite`, `.torchscript`, `.pt`, `.pb`, `.dali`, `.json` | as-is | copy |
-| `.bin` | — | consumed with its `.xml`; an orphan is an error |
-| `.pbtxt` | `<model>/config.pbtxt` | copy beside the version directory |
-| anything else | — | **error**, unless `STAGER_IGNORE_UNKNOWN=true` |
+## Output layouts
 
-That last row is deliberate. Silently skipping an unrecognized artifact yields a
-repository quietly missing a model, and the failure then surfaces as a 404 from a
-client long after the cause is out of sight.
+`REPOSITORY_LAYOUT` selects only the filename convention at the destination:
 
-OpenVINO resolves weights by basename, which is why the `.bin` is renamed rather
-than copied as-is — a plain copy produces a model that loads without weights.
+Dispatch is keyed by the input extension:
 
-## Layouts
-
-Servers agree on `<model>/<version>/` and disagree on what the file inside is
-called. `REPOSITORY_LAYOUT` picks the convention.
-
-| Staged | `triton` (default) | `ovms` | `neuriplo` [^1] |
+| Input extension | `triton` (default) | `ovms` | `neuriplo` [^1] |
 |---|---|---|---|
-| TensorRT engine | `model.plan` | *refused* | `model.plan` |
-| ONNX | `model.onnx` | `model.onnx` | `model.onnx` |
-| OpenVINO IR | `model.xml` + `.bin` | `model.xml` + `.bin` | `model.xml` + `.bin` |
-| TorchScript | `model.pt` | *refused* | `model.torchscript` |
-| TF frozen graph | `model.graphdef` | `model.pb` | `model.pb` |
-| TFLite | *refused* | *refused* | `model.tflite` |
-| ExecuTorch | *refused* | *refused* | `model.pte` |
-| DALI | `model.dali` | *refused* | `model.dali` |
-| Ensemble graph | *refused* | *refused* | `model.json` |
+| `.plan`, `.engine` | `model.plan` | refused | `model.plan` |
+| `.onnx` | `model.onnx` | `model.onnx` | `model.onnx` |
+| `.xml` + `.bin` | `model.xml` + `model.bin` | `model.xml` + `model.bin` | `model.xml` + `model.bin` |
+| `.torchscript` | `model.pt` | refused | `model.torchscript` |
+| `.pt` | `model.pt` | refused | `model.pt` |
+| `.pb` | `model.graphdef` | `model.pb` | `model.pb` |
+| `.tflite` | refused | `model.tflite` [^2] | `model.tflite` |
+| `.pte` | refused | refused | `model.pte` |
+| `.dali` | `model.dali` | refused | `model.dali` |
+| `.json` | refused | refused | `model.json` |
 
-[^1]: `neuriplo` targets my own runtime rather than a third-party server. If you
-are not using it, ignore that column.
+[^1]: `neuriplo` targets the author's own runtime. Ignore it unless using that
+runtime.
 
-"Refused" is a hard error naming the layout and the format, raised **before** any
-conversion runs. Writing the file anyway would cost minutes of engine build and
-produce a model the server never mentions, because a filename it does not
-recognize is one it silently ignores.
+[^2]: [OpenVINO Model Server's model-repository documentation](https://docs.openvino.ai/2023.3/ovms_docs_models_repository.html)
+lists TensorFlow Lite as a directly loadable format.
 
-[Triton declares ensembles](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#ensemble-models)
-in `config.pbtxt` with `platform: "ensemble"` rather than as a graph file, so a
-`.json` ensemble does not carry across — see [Ensembles](#ensembles).
+A refused combination fails before conversion or publication. Tree-form inputs
+are already repository-shaped and are copied verbatim; the operator is
+responsible for choosing a tree compatible with the selected runtime.
 
-## TensorRT
+[Triton ensembles](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#ensemble-models)
+are config-only models. A flat `config.pbtxt` declaring `platform: "ensemble"`
+creates the required empty version directory only for the `triton` layout.
 
-### Static models
+## Backend conversion
 
-Leave the shape variables unset. `trtexec` rejects explicit shapes on a model
-with fixed input dimensions:
+The neutral default preserves ONNX:
 
+```text
+ONNX_BACKEND=onnx_runtime   # default: copy model.onnx
 ```
-Static model does not take explicit shapes
+
+TensorRT conversion is explicit:
+
+```text
+ONNX_BACKEND=tensorrt
 ```
 
-### Dynamic models
-
-A model with dynamic axes needs an **optimization profile**, and a profile is
-`min`/`opt`/`max` together:
+That mode requires `trtexec` in the image and, for a real build, a compatible
+GPU. A conversion-capable image can be built with:
 
 ```bash
-TRT_MIN_SHAPES=input1:1x3x256x256
-TRT_OPT_SHAPES=input1:1x3x520x960
-TRT_MAX_SHAPES=input1:1x3x1080x1920
+docker build --build-arg BASE_IMAGE=nvcr.io/nvidia/tensorrt:25.12-py3 \
+  -t model-stager:tensorrt .
 ```
 
-`TRT_SHAPES` is **not** a shorthand for these. It sets a single inference shape
-and builds no profile, so an engine built with it cannot accept the range it was
-supposed to serve. Setting both is an error, as is setting only some of the
-three.
-
-### Mixed repositories
-
-One static and one dynamic model in the same repository cannot share a global
-shape setting — set `TRT_SHAPES` globally and every static model's build fails.
-Append the model name, uppercased with non-alphanumerics replaced by
-underscores:
+The TensorRT version used to build an engine must match the serving runtime.
+Static models need no shape variables. Dynamic models require all three profile
+bounds:
 
 ```bash
-TRT_MIN_SHAPES_RAFT_LARGE=input1:1x3x256x256
-TRT_OPT_SHAPES_RAFT_LARGE=input1:1x3x520x960
-TRT_MAX_SHAPES_RAFT_LARGE=input1:1x3x1080x1920
-TRT_PRECISION_YOLO26N_DEPTH=fp32
+TRT_MIN_SHAPES=input:1x3x256x256
+TRT_OPT_SHAPES=input:1x3x512x512
+TRT_MAX_SHAPES=input:1x3x1024x1024
 ```
 
-`TRT_SHAPES`, `TRT_MIN_SHAPES`, `TRT_OPT_SHAPES`, `TRT_MAX_SHAPES`,
-`TRT_PRECISION` and `TRT_EXTRA_ARGS` all take the suffix. A per-model value wins;
-the global applies to everything else. No model is named in any manifest
-*structure* — only in a variable whose value is the operator's business.
+Per-model overrides append the normalized model name, for example
+`TRT_PRECISION_MODEL_A=fp32`. The stager derives that suffix mechanically; it
+contains no built-in model identity. Names such as `model-a` and `model.a` may
+coexist unless a non-empty per-model TensorRT override for their shared
+`MODEL_A` suffix is active. In that case the stager refuses both rather than
+silently building two engines with one model's settings.
 
-### Cost
+## KServe integration
 
-Measured on an RTX 3060: **~8.5 min for a 101 MB model, ~2 min for a 21 MB one.**
-Mount `MODEL_REPOSITORY` on a persistent volume rather than an `emptyDir`, or
-that time is paid on every pod replacement. Staging is idempotent, so a restart
-against a warm volume finishes in seconds.
+[KServe](https://github.com/kserve/kserve) uses `modelFormat` to select a
+compatible serving runtime and `storageUri` or `storageUris` to locate model
+artifacts. Its storage initializer makes those artifacts local to the serving
+container, normally under `/mnt/models`.
 
-Budget for the cold case in Kubernetes: `progressDeadlineSeconds` must cover the
-build, or the rollout is marked failed while it is still legitimately running.
+Those fields remain KServe control-plane inputs. `model-stager` neither parses
+an `InferenceService` nor downloads S3, GCS, PVC, HTTP, or Hugging Face URIs.
+
+There are two valid flows:
+
+```text
+Already runtime-shaped:
+storageUri -> KServe storage initializer -> /mnt/models -> runtime
+                                            (no stager)
+
+Raw or mixed local artifacts:
+storage initializer or volume -> /mnt/input-models
+                              -> model-stager
+                              -> /mnt/models
+                              -> runtime
+```
+
+`/mnt/models` is KServe's default local mount. `/model_repository` is this
+project's generic container default. Both are supported by setting
+`MODEL_REPOSITORY`; neither path changes dispatch behavior.
+
+See [examples](examples/README.md) for direct, staged, and KServe-native flows.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STAGE_DIR` | `/staging` | where staged artifacts are read from |
-| `MODEL_REPOSITORY` | `/models/repo` | repository root to build |
-| `MODEL_VERSION` | `1` | version directory for flat-form artifacts |
-| `REPOSITORY_LAYOUT` | `triton` | `triton`, `ovms`, or `neuriplo` |
-| `SERVER_EXEC` | *unset* | when set, `exec` this after staging (see below) |
-| `ONNX_BACKEND` | `tensorrt` | `tensorrt` (compile) or `onnx_runtime` (copy) |
-| `TRT_PRECISION` | `fp16` | `fp16`, `fp32`, or `best` |
-| `TRT_SHAPES` | *unset* | single shape spec; **not** a profile |
-| `TRT_MIN_SHAPES` / `TRT_OPT_SHAPES` / `TRT_MAX_SHAPES` | *unset* | optimization profile; all three required together |
-| `TRT_EXTRA_ARGS` | *unset* | extra `trtexec` arguments, word-split |
-| `TRT_FALLBACK_ONNX` | `false` | keep the ONNX if `trtexec` is missing |
-| `STAGER_IGNORE_UNKNOWN` | `false` | skip unrecognized files instead of failing |
-
-### `SERVER_EXEC`
-
-By default the stager stages and exits — an init container should not start
-anything. Setting `SERVER_EXEC` makes it `exec` a server afterwards, with the
-container's own arguments appended:
-
-```bash
-SERVER_EXEC="tritonserver --model-repository=/models/repo"
-```
-
-This is only needed when the build must happen *inside* the serving container,
-which is the narrower case. Prefer the default.
+| `STAGE_DIR` | `/staging` | catalog root containing flat artifacts or model directories |
+| `MODEL_INPUTS` | unset | newline-separated `name=local-path` records; exclusive with `MODELS` |
+| `MODELS` | unset | comma- or space-separated catalog selection; unset selects all |
+| `MODEL_REPOSITORY` | `/model_repository` | output repository root |
+| `MODEL_VERSION` | `1` | numeric version for flat artifacts |
+| `REPOSITORY_LAYOUT` | `triton` | `triton`, `ovms`, or `neuriplo` filename convention |
+| `ONNX_BACKEND` | `onnx_runtime` | preserve ONNX or explicitly request `tensorrt` conversion |
+| `SERVER_EXEC` | unset | optional command to `exec` after successful staging |
+| `TRT_PRECISION` | `fp16` | `fp16`, `fp32`, or `best` for explicit TensorRT conversion |
+| `TRT_SHAPES` | unset | one fixed inference shape; not an optimization profile |
+| `TRT_MIN_SHAPES` / `TRT_OPT_SHAPES` / `TRT_MAX_SHAPES` | unset | dynamic profile; all three required |
+| `TRT_EXTRA_ARGS` | unset | extra `trtexec` arguments, word-split |
+| `TRT_FALLBACK_ONNX` | `false` | explicit fallback when TensorRT tooling is absent |
+| `STAGER_ADOPT_UNVERIFIED_TENSORRT` | `false` | explicitly trust a metadata-free existing TensorRT engine during migration |
+| `STAGER_IGNORE_UNKNOWN` | `false` | skip unknown catalog files and hidden model-root entries when true |
 
 ## Guarantees
 
-These hold on every run, because staging re-runs on every restart:
+1. **Model- and task-agnostic.** Names come from input records or filenames;
+   configs are carried through without interpreting tensors, backends, or tasks.
+2. **Backend-neutral by default.** Portable artifacts remain portable unless a
+   conversion is explicitly requested.
+3. **Fail loud.** Missing, ambiguous, duplicate, unsafe, or unsupported inputs
+   are errors.
+4. **Verified idempotency.** Flat versions record request and output
+   fingerprints; tree versions are compared recursively. A changed source,
+   output-affecting backend or build setting, or published output is refused
+   until the operator explicitly removes the old version. Equivalent input
+   extensions or layouts that resolve to the same target are accepted. Config
+   updates are independent and atomic.
+5. **Atomic publication.** Version directories and config files are prepared at
+   temporary paths and renamed into place.
+6. **POSIX `sh`, one file.** The script runs under BusyBox `ash` and `dash` and
+   has no sourced helper directory.
+7. **Single writer.** Concurrent stagers must not write the same repository.
+   Temporary cleanup and publication assume one owning process; deployments
+   should use one staging Job or a `Recreate` rollout strategy.
 
-1. **Idempotent.** A model whose output already exists is skipped. A restart
-   against a warm volume rebuilds nothing.
-2. **Atomic.** Each version is built in a temp directory and published by
-   renaming that directory. A per-file rename would be enough for a single-file
-   model but not for OpenVINO's `.xml` + `.bin`, where a crash between two
-   renames leaves a model that loads without weights.
-3. **No silent substitution.** If the requested backend cannot be produced, the
-   run fails. Serving a different backend has a different latency and accuracy
-   profile, so it is only ever opt-in (`TRT_FALLBACK_ONNX=true`).
-4. **Nothing is named.** The model name comes from the filename, the backend
-   from the filename written. Adding or removing a model changes no manifest.
-5. **`exec` last.** With `SERVER_EXEC`, the server replaces this process, so
-   signals and exit codes propagate.
+Flat versions contain `.model-stager-state` and `.model-stager-output`.
+These dotfiles are deliberate stager metadata inside the atomically published
+version directory. A compatible version created by 0.1.0 has neither file; the
+first restart adopts it and writes the metadata. Direct-copy artifacts are
+compared before adoption. A previously converted TensorRT engine cannot be
+verified against its ONNX source, so metadata-free TensorRT versions are
+refused by default. Set `STAGER_ADOPT_UNVERIFIED_TENSORRT=true` for a one-time,
+warning-emitting adoption only when the operator explicitly trusts the existing
+engine.
 
-## Failure modes
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `Static model does not take explicit shapes` | shape variables set for a fixed-dimension ONNX | unset them; they are for dynamic axes |
-| Engine rejects the shapes it should serve | built with `TRT_SHAPES` instead of a profile | use `TRT_MIN`/`OPT`/`MAX_SHAPES` |
-| `needs TRT_MIN_SHAPES, TRT_OPT_SHAPES and TRT_MAX_SHAPES together` | partial profile | set all three |
-| `no servable artifacts staged in /staging` | nothing staged, or the volume is not shared | check both containers mount the same staging volume |
-| `unrecognized staged file` | an artifact with no dispatch arm | add one, or `STAGER_IGNORE_UNKNOWN=true` |
-| `... has no matching .xml` | OpenVINO weights staged without the model | stage both, same basename |
-| `layout '<x>' cannot serve a .<ext> model` | format the target server cannot load | change layout, or export a format it can serve |
-| `trtexec not found in PATH` | image has no TensorRT | use the TensorRT base, or `ONNX_BACKEND=onnx_runtime` |
-| Version mismatch when the server loads an engine | stager and server ship different TensorRT | align the image tags |
-| Rollout failed while logs show a build running | `progressDeadlineSeconds` shorter than the build | raise it |
+Verification reads source and published files to compute checksums, while
+repository-shaped trees are recursively compared. This favors detecting drift
+over minimal restart I/O and can be significant for multi-gigabyte models on a
+remote PVC.
 
 ## Development
 
 ```bash
 tests/test-model-stager.sh
+shellcheck bin/model-stager tests/test-model-stager.sh
 ```
 
-132 assertions, no GPU, no TensorRT, no server: `trtexec` and the server are
-stubs on `PATH` that record how they were called. What is under test is the
-dispatch and the tree it produces.
-
-`bin/model-stager` is POSIX `sh` and stays that way — the container shell is
-often busybox `ash`. CI runs the suite under `bash` and `dash`, and lints with
-`shellcheck`.
-
-It is also deliberately a single self-contained file, so it can be `COPY`d into
-any image without carrying a directory of sourced helpers around with it.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+The suite currently contains 271 assertions. It stubs `trtexec` and the optional
+server command, so it needs no GPU, TensorRT installation, or serving runtime.
+CI runs it under both the normal shell and `dash`.

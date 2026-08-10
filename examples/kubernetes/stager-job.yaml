@@ -1,0 +1,28 @@
+# Populate a repository PVC from a local artifact-catalog PVC. The model names
+# below are operator input values; model-stager contains no knowledge of them.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-stager
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: model-stager
+          image: your-registry/model-stager:latest
+          env:
+            - {name: STAGE_DIR, value: /staging}
+            - {name: MODELS, value: "model-a,model-b"}
+            - {name: MODEL_REPOSITORY, value: /model_repository}
+            - {name: REPOSITORY_LAYOUT, value: triton}
+          volumeMounts:
+            - {name: input, mountPath: /staging, readOnly: true}
+            - {name: output, mountPath: /model_repository}
+      volumes:
+        - name: input
+          persistentVolumeClaim:
+            claimName: model-artifacts
+        - name: output
+          persistentVolumeClaim:
+            claimName: model-repository

@@ -1,7 +1,7 @@
 #!/bin/sh
 # model-stager -- build a model repository tree from staged artifacts.
 #
-# Server-agnostic and format-general by construction. ONNX, TensorRT, OpenVINO
+# Server-neutral and backend-neutral by default. ONNX, TensorRT, OpenVINO
 # IR, TorchScript, TensorFlow, TFLite, ExecuTorch, DALI and ensemble graphs mix
 # freely in one repository. The output is a versioned model repository
 # tree -- <model>/<version>/<file> -- the layout introduced by Triton
@@ -36,9 +36,10 @@
 # express it directly instead of this script growing a config language.
 #
 # Environment:
-#   STAGE_DIR              directory the artifacts were staged into
-#                          (default /staging)
-#   MODEL_REPOSITORY       repository root to build (default /models/repo)
+#   STAGE_DIR              catalog directory to scan (default /staging). Its
+#                          entries may be flat artifacts or repository-shaped
+#                          model directories.
+#   MODEL_REPOSITORY       repository root to build (default /model_repository)
 #   MODEL_VERSION          version directory for flat-form artifacts (default 1)
 #   REPOSITORY_LAYOUT      filename convention of the server that will read the
 #                          tree (default triton): neuriplo | triton | ovms.
@@ -51,7 +52,7 @@
 #                          with the container's own arguments appended. Unset
 #                          means stage and exit, which is the normal init
 #                          container behaviour.
-#   ONNX_BACKEND           what a staged .onnx becomes (default tensorrt):
+#   ONNX_BACKEND           what a staged .onnx becomes (default onnx_runtime):
 #                            tensorrt     - compile to a TensorRT engine
 #                            onnx_runtime - copy as ONNX, no compilation
 #   TRT_PRECISION          fp16 (default), fp32, or best
@@ -74,26 +75,40 @@
 #                          around it identical whatever is being served. A name
 #                          that is not in STAGE_DIR is an error, not a smaller
 #                          repository.
+#                          Names use letters, digits, dots, underscores, and
+#                          hyphens.
+#   MODEL_INPUTS           newline-separated name=path records. Each path names
+#                          one flat artifact or one repository-shaped model
+#                          directory. A flat artifact also carries a
+#                          same-basename .pbtxt when present. This explicit mode
+#                          is mutually exclusive with MODELS and does not require
+#                          STAGE_DIR.
 #   STAGER_IGNORE_UNKNOWN  when true, skip unrecognized staged files instead of
 #                          failing. Off by default: a silently dropped artifact
 #                          surfaces much later as a 404 from a client.
+#   STAGER_ADOPT_UNVERIFIED_TENSORRT
+#                          when true, explicitly trust a state-less TensorRT
+#                          engine during migration. Off by default because its
+#                          ONNX source cannot be compared with the engine.
 #
 # Per-model overrides. A heterogeneous repository can hold one static and one
 # dynamic model, which a single global shape setting cannot express. Append the
 # model name uppercased with non-alphanumerics replaced by underscores:
-#   TRT_MIN_SHAPES_RAFT_LARGE=...  TRT_PRECISION_YOLO26N_DEPTH=fp32
+#   TRT_MIN_SHAPES_DYNAMIC_MODEL=...  TRT_PRECISION_STATIC_MODEL=fp32
 set -eu
 
 STAGE_DIR="${STAGE_DIR:-/staging}"
-MODEL_REPOSITORY="${MODEL_REPOSITORY:-/models/repo}"
+MODEL_REPOSITORY="${MODEL_REPOSITORY:-/model_repository}"
 MODEL_VERSION="${MODEL_VERSION:-1}"
 REPOSITORY_LAYOUT="${REPOSITORY_LAYOUT:-triton}"
 SERVER_EXEC="${SERVER_EXEC:-}"
-ONNX_BACKEND="${ONNX_BACKEND:-tensorrt}"
+ONNX_BACKEND="${ONNX_BACKEND:-onnx_runtime}"
 TRT_PRECISION="${TRT_PRECISION:-fp16}"
 TRT_FALLBACK_ONNX="${TRT_FALLBACK_ONNX:-false}"
 STAGER_IGNORE_UNKNOWN="${STAGER_IGNORE_UNKNOWN:-false}"
+STAGER_ADOPT_UNVERIFIED_TENSORRT="${STAGER_ADOPT_UNVERIFIED_TENSORRT:-false}"
 MODELS="${MODELS:-}"
+MODEL_INPUTS="${MODEL_INPUTS:-}"
 
 # Which models to take out of STAGE_DIR. Unset means all of them.
 #
@@ -103,6 +118,19 @@ MODELS="${MODELS:-}"
 # being served. Commas or spaces.
 MODELS_WANTED=$(printf '%s' "$MODELS" | tr ',;' '  ')
 MODELS_FOUND=""
+
+validate_model_name() {
+    case "$1" in
+        '' | .* | *[!A-Za-z0-9._-]*)
+            echo "error: invalid model name '$1': use letters, digits, '.', '_', or '-'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+for requested_model in $MODELS_WANTED; do
+    validate_model_name "$requested_model"
+done
 
 model_selected() {
     [ -z "$MODELS_WANTED" ] && return 0
@@ -177,24 +205,53 @@ target_filename() {
                 xml) echo "model.xml" ;;
                 onnx) echo "model.onnx" ;;
                 pb) echo "model.pb" ;;
+                tflite) echo "model.tflite" ;;
                 *) echo "" ;;
             esac
             ;;
     esac
 }
 
-if [ ! -d "$STAGE_DIR" ]; then
-    echo "error: staging directory not found: $STAGE_DIR" >&2
+case "$MODEL_VERSION" in
+    '' | *[!0-9]*)
+        echo "error: invalid MODEL_VERSION '$MODEL_VERSION': expected digits only" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$MODEL_INPUTS" ] && [ -n "$MODELS_WANTED" ]; then
+    echo "error: MODEL_INPUTS and MODELS are mutually exclusive" >&2
     exit 1
 fi
+
+# Environment-variable-safe suffix derived from a model name. Validation uses
+# it to reject only collisions on active per-model TensorRT settings.
+model_override_key() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]' |
+        sed 's/[^A-Z0-9]/_/g'
+}
+
+# True only when two ONNX inputs would actually read the same non-empty
+# per-model TensorRT setting. Global settings and inactive suffixes do not make
+# otherwise valid repository names ambiguous.
+tensorrt_override_key_in_use() {
+    key_in_use_key="$1"
+    [ "$ONNX_BACKEND" = "tensorrt" ] || return 1
+    command -v trtexec >/dev/null 2>&1 || return 1
+    for key_in_use_prefix in TRT_PRECISION TRT_SHAPES TRT_MIN_SHAPES \
+        TRT_OPT_SHAPES TRT_MAX_SHAPES TRT_EXTRA_ARGS; do
+        eval "key_in_use_value=\${${key_in_use_prefix}_${key_in_use_key}:-}"
+        [ -n "$key_in_use_value" ] && return 0
+    done
+    return 1
+}
 
 # Value of <prefix>_<MODEL> if set, else the value of <prefix>. Lets one model in
 # a mixed repository override a global without the manifest naming models.
 model_override() {
     override_prefix="$1"
     override_model="$2"
-    override_key=$(printf '%s' "$override_model" | tr '[:lower:]' '[:upper:]' |
-        sed 's/[^A-Z0-9]/_/g')
+    override_key=$(model_override_key "$override_model")
     eval "override_value=\${${override_prefix}_${override_key}:-}"
     if [ -n "$override_value" ]; then
         printf '%s' "$override_value"
@@ -223,16 +280,84 @@ publish() {
     echo "staged $publish_target_dir"
 }
 
-# True when the version directory exists, so a restart against a warm volume
-# neither rebuilds an engine (minutes) nor re-copies a model.
-#
-# Existence, not non-emptiness: a Triton ensemble's version directory is legally
-# empty -- the model is declared entirely in config.pbtxt -- and treating empty
-# as unstaged made every restart re-stage it. A version directory only ever
-# exists because a publish succeeded; a failed run removes its temp directory and
-# never creates the target.
+# Existence alone is sufficient only for a config-only ensemble. Flat artifacts
+# carry an input-and-dispatch fingerprint, and tree inputs are compared against
+# the published version before either is skipped.
 already_staged() {
     [ -d "$1" ]
+}
+
+# Return a content fingerprint without embedding the source path. cksum is
+# specified by POSIX and supplied by BusyBox.
+fingerprint_file() {
+    fingerprint_path="$1"
+    if ! fingerprint_value=$(cksum <"$fingerprint_path"); then
+        echo "error: cannot checksum input: $fingerprint_path" >&2
+        exit 1
+    fi
+    # cksum writes two fields when reading stdin: checksum and byte count.
+    # shellcheck disable=SC2086
+    set -- $fingerprint_value
+    if [ "$#" -lt 2 ]; then
+        echo "error: invalid cksum output for input: $fingerprint_path" >&2
+        exit 1
+    fi
+    printf '%s:%s' "$1" "$2"
+}
+
+# config.pbtxt remains opaque except for its optional top-level repository name.
+# Checking that structural field prevents a renamed directory from reaching a
+# runtime with a self-contradictory config; tensors, shapes, task metadata, and
+# backend settings are never interpreted.
+config_declared_name() {
+    awk '
+        /^[[:space:]]*name[[:space:]]*:[[:space:]]*"[^"]*"/ {
+            if (brace_depth == 0) {
+                line = $0
+                sub(/^[[:space:]]*name[[:space:]]*:[[:space:]]*"/, "", line)
+                sub(/".*$/, "", line)
+                print line
+                exit
+            }
+        }
+        {
+            opens = gsub(/[{]/, "{")
+            closes = gsub(/[}]/, "}")
+            brace_depth += opens - closes
+        }
+    ' "$1"
+}
+
+validate_config_name() {
+    config_source="$1"
+    config_model="$2"
+    [ -f "$config_source" ] || return 0
+    config_name=$(config_declared_name "$config_source")
+    if [ -n "$config_name" ] && [ "$config_name" != "$config_model" ]; then
+        echo "error: configured input cannot be renamed from '$config_name' to '$config_model'" >&2
+        echo "       config.pbtxt is passed through unchanged" >&2
+        exit 1
+    fi
+}
+
+# Config files live beside version directories, so publish them through a temp
+# file and rename as well. This also makes a source config that is already at the
+# destination safe: cp writes a distinct file before mv replaces it.
+copy_config() {
+    config_source="$1"
+    config_model_dir="$2"
+    config_model="$3"
+    validate_config_name "$config_source" "$config_model"
+    mkdir -p "$config_model_dir"
+    config_target="$config_model_dir/config.pbtxt"
+    if [ -f "$config_target" ] && cmp -s "$config_source" "$config_target"; then
+        return 0
+    fi
+    config_tmp="$config_model_dir/.stager-config.$$"
+    rm -f "$config_tmp"
+    cp "$config_source" "$config_tmp"
+    mv "$config_tmp" "$config_target"
+    echo "applied config overlay $config_target"
 }
 
 # A Triton ensemble declares itself in config.pbtxt and has no model file. This
@@ -300,7 +425,7 @@ convert_onnx() {
         set -- "$@" $convert_extra
     fi
 
-    trtexec "$@"
+    trtexec "$@" </dev/null
 }
 
 # Refuses a format the target server cannot load, naming the layout, so the
@@ -321,6 +446,21 @@ resolve_target() {
     fi
 }
 
+write_flat_metadata() {
+    metadata_dir="$1"
+    metadata_state="$2"
+    metadata_output="$3"
+    metadata_state_tmp="$metadata_dir/.model-stager-state.$$"
+    metadata_output_tmp="$metadata_dir/.model-stager-output.$$"
+    rm -f "$metadata_state_tmp" "$metadata_output_tmp"
+    printf '%s\n' "$metadata_output" >"$metadata_output_tmp"
+    printf '%s\n' "$metadata_state" >"$metadata_state_tmp"
+    # State moves last: its presence is the marker that both files were
+    # published, so an interrupted adoption remains safely retryable.
+    mv "$metadata_output_tmp" "$metadata_dir/.model-stager-output"
+    mv "$metadata_state_tmp" "$metadata_dir/.model-stager-state"
+}
+
 # Dispatch on the staged artifact's extension. The filename this writes is the
 # whole backend declaration -- every supported server infers the backend from it,
 # so nothing downstream restates the choice.
@@ -329,20 +469,29 @@ stage_flat() {
     model_name="$2"
     extension="$3"
 
-    target_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
-    if already_staged "$target_dir"; then
-        echo "already staged, skipping: $target_dir"
-        return 0
+    source_config="${source_file%.*}.pbtxt"
+    if [ -f "$source_config" ]; then
+        validate_config_name "$source_config" "$model_name"
     fi
 
     # Resolved before any work is done, so an unsupported format cannot leave a
     # temp directory behind.
+    effective_backend="copy"
     case "$extension" in
         onnx)
-            if [ "$ONNX_BACKEND" = "onnx_runtime" ] || ! command -v trtexec >/dev/null 2>&1; then
+            if [ "$ONNX_BACKEND" = "onnx_runtime" ]; then
                 resolve_target onnx "$model_name"
-            else
+                effective_backend="onnx_runtime"
+            elif command -v trtexec >/dev/null 2>&1; then
                 resolve_target plan "$model_name"
+                effective_backend="tensorrt"
+            elif [ "$TRT_FALLBACK_ONNX" = "true" ]; then
+                resolve_target onnx "$model_name"
+                effective_backend="onnx_runtime-fallback"
+            else
+                echo "error: trtexec not found in PATH and TRT_FALLBACK_ONNX is not true" >&2
+                echo "       set ONNX_BACKEND=onnx_runtime to serve $model_name without a build" >&2
+                exit 1
             fi
             ;;
         engine) resolve_target plan "$model_name" ;;
@@ -350,28 +499,114 @@ stage_flat() {
     esac
     target_name="$RESOLVED_TARGET"
 
+    source_fingerprint=$(fingerprint_file "$source_file")
+    companion_fingerprint="none"
+    if [ "$extension" = "xml" ]; then
+        companion="${source_file%.xml}.bin"
+        if [ ! -f "$companion" ]; then
+            echo "error: $source_file has no matching .bin weights file" >&2
+            exit 1
+        fi
+        companion_fingerprint=$(fingerprint_file "$companion")
+    fi
+
+    build_fingerprint="none"
+    if [ "$effective_backend" = "tensorrt" ]; then
+        build_fingerprint="precision=$(model_override TRT_PRECISION "$model_name")
+shapes=$(model_override TRT_SHAPES "$model_name")
+min_shapes=$(model_override TRT_MIN_SHAPES "$model_name")
+opt_shapes=$(model_override TRT_OPT_SHAPES "$model_name")
+max_shapes=$(model_override TRT_MAX_SHAPES "$model_name")
+extra_args=$(model_override TRT_EXTRA_ARGS "$model_name")"
+    fi
+
+    # state_version is an opaque cache-buster, not a migration protocol. A
+    # future incompatible state shape must be handled before changing it if
+    # automatic migration is required.
+    flat_state="state_version=2
+target=$target_name
+backend=$effective_backend
+source=$source_fingerprint
+companion=$companion_fingerprint
+$build_fingerprint"
+
+    target_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
+    if already_staged "$target_dir"; then
+        published_state=""
+        if [ -f "$target_dir/.model-stager-state" ]; then
+            published_state=$(cat "$target_dir/.model-stager-state")
+        fi
+        published_output=""
+        if [ -f "$target_dir/.model-stager-output" ]; then
+            published_output=$(cat "$target_dir/.model-stager-output")
+        fi
+        target_complete=""
+        current_output=""
+        if [ -f "$target_dir/$target_name" ]; then
+            target_complete="yes"
+            current_output="target=$(fingerprint_file "$target_dir/$target_name")
+companion=none"
+            if [ "$extension" = "xml" ] &&
+                [ ! -f "$target_dir/${target_name%.xml}.bin" ]; then
+                target_complete=""
+            elif [ "$extension" = "xml" ]; then
+                current_output="target=$(fingerprint_file "$target_dir/$target_name")
+companion=$(fingerprint_file "$target_dir/${target_name%.xml}.bin")"
+            fi
+        fi
+        if [ ! -f "$target_dir/.model-stager-state" ] &&
+            [ -n "$target_complete" ]; then
+            adoption_compatible="yes"
+            if [ "$effective_backend" = "tensorrt" ]; then
+                if [ "$STAGER_ADOPT_UNVERIFIED_TENSORRT" != "true" ]; then
+                    echo "error: cannot verify existing TensorRT engine against its ONNX source: $target_dir" >&2
+                    echo "       rebuild it, or explicitly set STAGER_ADOPT_UNVERIFIED_TENSORRT=true" >&2
+                    exit 1
+                fi
+                echo "WARNING: adopting unverified TensorRT engine: $target_dir" >&2
+            else
+                if ! cmp -s "$source_file" "$target_dir/$target_name"; then
+                    adoption_compatible=""
+                elif [ "$extension" = "xml" ] &&
+                    ! cmp -s "$companion" "$target_dir/${target_name%.xml}.bin"; then
+                    adoption_compatible=""
+                fi
+            fi
+            if [ -n "$adoption_compatible" ]; then
+                write_flat_metadata "$target_dir" "$flat_state" "$current_output"
+                echo "adopting untracked existing version: $target_dir"
+                return 0
+            fi
+        fi
+        if [ "$published_state" = "$flat_state" ] &&
+            [ "$published_output" = "$current_output" ] &&
+            [ -n "$target_complete" ]; then
+            echo "already staged and verified, skipping: $target_dir"
+            return 0
+        fi
+        echo "error: existing version does not match requested staging: $target_dir" >&2
+        echo "       remove that version explicitly before replacing it" >&2
+        exit 1
+    fi
+
     work_dir="$MODEL_REPOSITORY/$model_name/.stager-tmp.$MODEL_VERSION.$$"
     rm -rf "$work_dir"
     mkdir -p "$work_dir"
 
     case "$extension" in
         onnx)
-            if [ "$ONNX_BACKEND" = "onnx_runtime" ]; then
-                cp "$source_file" "$work_dir/$target_name"
-            elif command -v trtexec >/dev/null 2>&1; then
-                convert_onnx "$source_file" "$work_dir/$target_name" "$model_name"
-            elif [ "$TRT_FALLBACK_ONNX" = "true" ]; then
-                # Explicitly opted into: serving the ONNX is a different
-                # execution path with different latency, so it is never a silent
-                # substitution.
-                echo "warning: trtexec not found; TRT_FALLBACK_ONNX=true, serving ONNX" >&2
-                cp "$source_file" "$work_dir/$target_name"
-            else
-                echo "error: trtexec not found in PATH and TRT_FALLBACK_ONNX is not true" >&2
-                echo "       set ONNX_BACKEND=onnx_runtime to serve $model_name without a build" >&2
-                rm -rf "$work_dir"
-                exit 1
-            fi
+            case "$effective_backend" in
+                tensorrt)
+                    convert_onnx "$source_file" "$work_dir/$target_name" "$model_name"
+                    ;;
+                onnx_runtime)
+                    cp "$source_file" "$work_dir/$target_name"
+                    ;;
+                onnx_runtime-fallback)
+                    echo "warning: trtexec not found; TRT_FALLBACK_ONNX=true, serving ONNX" >&2
+                    cp "$source_file" "$work_dir/$target_name"
+                    ;;
+            esac
             ;;
         plan | engine)
             # A prebuilt engine is only valid if it was built on this node; taken
@@ -383,20 +618,20 @@ stage_flat() {
             # OpenVINO resolves weights by basename, so the .bin has to be
             # renamed alongside the .xml or the model loads without weights.
             cp "$source_file" "$work_dir/$target_name"
-            companion="${source_file%.xml}.bin"
-            if [ -f "$companion" ]; then
-                cp "$companion" "$work_dir/${target_name%.xml}.bin"
-            else
-                echo "error: $source_file has no matching .bin weights file" >&2
-                rm -rf "$work_dir"
-                exit 1
-            fi
+            cp "$companion" "$work_dir/${target_name%.xml}.bin"
             ;;
         *)
             cp "$source_file" "$work_dir/$target_name"
             ;;
     esac
 
+    current_output="target=$(fingerprint_file "$work_dir/$target_name")
+companion=none"
+    if [ "$extension" = "xml" ]; then
+        current_output="target=$(fingerprint_file "$work_dir/$target_name")
+companion=$(fingerprint_file "$work_dir/${target_name%.xml}.bin")"
+    fi
+    write_flat_metadata "$work_dir" "$flat_state" "$current_output"
     publish "$work_dir" "$target_dir"
 }
 
@@ -405,6 +640,10 @@ stage_tree() {
     source_dir="$1"
     model_name="$2"
 
+    if [ -f "$source_dir/config.pbtxt" ]; then
+        validate_config_name "$source_dir/config.pbtxt" "$model_name"
+    fi
+
     tree_staged=""
     for version_dir in "$source_dir"/*; do
         [ -d "$version_dir" ] || continue
@@ -412,7 +651,12 @@ stage_tree() {
 
         target_dir="$MODEL_REPOSITORY/$model_name/$version_name"
         if already_staged "$target_dir"; then
-            echo "already staged, skipping: $target_dir"
+            if ! diff -qr "$version_dir" "$target_dir" >/dev/null 2>&1; then
+                echo "error: existing version does not match repository-shaped input: $target_dir" >&2
+                echo "       remove that version explicitly before replacing it" >&2
+                exit 1
+            fi
+            echo "already staged and verified, skipping: $target_dir"
             tree_staged="yes"
             continue
         fi
@@ -427,8 +671,7 @@ stage_tree() {
 
     # A config.pbtxt sits beside the version directories, not inside one.
     if [ -f "$source_dir/config.pbtxt" ]; then
-        mkdir -p "$MODEL_REPOSITORY/$model_name"
-        cp "$source_dir/config.pbtxt" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
+        copy_config "$source_dir/config.pbtxt" "$MODEL_REPOSITORY/$model_name" "$model_name"
     fi
 
     if [ -z "$tree_staged" ]; then
@@ -437,13 +680,298 @@ stage_tree() {
     fi
 }
 
+# A repository-shaped single model has numeric version directories at its root.
+# config.pbtxt is the only permitted top-level file; accepting other files as a
+# tree would silently drop them.
+is_single_model_tree() {
+    tree_source="$1"
+    tree_has_version=""
+    for tree_entry in "$tree_source"/*; do
+        [ -e "$tree_entry" ] || continue
+        tree_name=$(basename "$tree_entry")
+        if [ -d "$tree_entry" ]; then
+            case "$tree_name" in
+                '' | *[!0-9]*) return 1 ;;
+            esac
+            tree_has_version="yes"
+        elif [ "$tree_name" != "config.pbtxt" ]; then
+            return 1
+        fi
+    done
+    [ -n "$tree_has_version" ]
+}
+
+stage_ensemble_config() {
+    ensemble_source="$1"
+    ensemble_model="$2"
+    if [ "$REPOSITORY_LAYOUT" != "triton" ]; then
+        echo "error: layout '$REPOSITORY_LAYOUT' cannot serve a Triton ensemble ($ensemble_model)" >&2
+        exit 1
+    fi
+
+    ensemble_dir="$MODEL_REPOSITORY/$ensemble_model/$MODEL_VERSION"
+    if already_staged "$ensemble_dir"; then
+        ensemble_contents=$(find "$ensemble_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+        if [ -n "$ensemble_contents" ]; then
+            echo "error: ensemble version directory is not empty: $ensemble_dir" >&2
+            echo "       remove the existing flat model before staging an ensemble" >&2
+            exit 1
+        fi
+    else
+        ensemble_work="$MODEL_REPOSITORY/$ensemble_model/.stager-tmp.$MODEL_VERSION.$$"
+        rm -rf "$ensemble_work"
+        mkdir -p "$ensemble_work"
+        publish "$ensemble_work" "$ensemble_dir"
+    fi
+    copy_config "$ensemble_source" "$MODEL_REPOSITORY/$ensemble_model" "$ensemble_model"
+    echo "staged ensemble $MODEL_REPOSITORY/$ensemble_model (version $MODEL_VERSION empty by design)"
+}
+
+stage_explicit_inputs() {
+    while IFS= read -r explicit_record || [ -n "$explicit_record" ]; do
+        [ -n "$explicit_record" ] || continue
+        explicit_name=${explicit_record%%=*}
+        explicit_path=${explicit_record#*=}
+
+        if [ -d "$explicit_path" ]; then
+            stage_tree "$explicit_path" "$explicit_name"
+        else
+            explicit_base=$(basename "$explicit_path")
+            case "$explicit_base" in
+                *.*) explicit_extension=${explicit_base##*.} ;;
+                *) explicit_extension="" ;;
+            esac
+            case "$explicit_extension" in
+                onnx | plan | engine | xml | pte | tflite | torchscript | pt | pb | dali | json)
+                    stage_flat "$explicit_path" "$explicit_name" "$explicit_extension"
+                    ;;
+                pbtxt)
+                    if ! is_ensemble_config "$explicit_path"; then
+                        echo "error: config-only input is not a Triton ensemble: $explicit_path" >&2
+                        exit 1
+                    fi
+                    stage_ensemble_config "$explicit_path" "$explicit_name"
+                    ;;
+                *)
+                    echo "error: unrecognized explicit input: $explicit_path" >&2
+                    exit 1
+                    ;;
+            esac
+            explicit_config="${explicit_path%.*}.pbtxt"
+            if [ "$explicit_extension" != "pbtxt" ] && [ -f "$explicit_config" ]; then
+                copy_config "$explicit_config" "$MODEL_REPOSITORY/$explicit_name" "$explicit_name"
+            fi
+        fi
+        model_mark_found "$explicit_name"
+        staged_any="yes"
+    done <<EOF_INPUTS
+$MODEL_INPUTS
+EOF_INPUTS
+}
+
+validate_explicit_inputs() {
+    explicit_seen=""
+    explicit_override_seen=""
+    explicit_count=0
+    while IFS= read -r explicit_record || [ -n "$explicit_record" ]; do
+        [ -n "$explicit_record" ] || continue
+        case "$explicit_record" in
+            *=*) ;;
+            *)
+                echo "error: invalid MODEL_INPUTS record '$explicit_record': expected name=path" >&2
+                exit 1
+                ;;
+        esac
+        explicit_name=${explicit_record%%=*}
+        explicit_path=${explicit_record#*=}
+        validate_model_name "$explicit_name"
+        case " $explicit_seen " in
+            *" $explicit_name "*)
+                echo "error: multiple MODEL_INPUTS records for model '$explicit_name'" >&2
+                exit 1
+                ;;
+        esac
+        if [ ! -e "$explicit_path" ]; then
+            echo "error: input path not found for $explicit_name: $explicit_path" >&2
+            exit 1
+        fi
+        if [ -d "$explicit_path" ]; then
+            check_hidden_model_entries "$explicit_path"
+            if ! is_single_model_tree "$explicit_path"; then
+                echo "error: input directory is not one repository-shaped model: $explicit_path" >&2
+                exit 1
+            fi
+            if [ -f "$explicit_path/config.pbtxt" ]; then
+                validate_config_name "$explicit_path/config.pbtxt" "$explicit_name"
+            fi
+        else
+            explicit_base=$(basename "$explicit_path")
+            case "$explicit_base" in
+                *.*) explicit_extension=${explicit_base##*.} ;;
+                *) explicit_extension="" ;;
+            esac
+            if [ "$explicit_extension" = "onnx" ]; then
+                explicit_override_key=$(model_override_key "$explicit_name")
+                if tensorrt_override_key_in_use "$explicit_override_key"; then
+                    case " $explicit_override_seen " in
+                        *" $explicit_override_key "*)
+                            echo "error: TensorRT model names normalize to the active environment override suffix '$explicit_override_key'" >&2
+                            echo "       rename one model or remove its per-model TRT_*_${explicit_override_key} setting" >&2
+                            exit 1
+                            ;;
+                    esac
+                    explicit_override_seen="$explicit_override_seen $explicit_override_key"
+                fi
+            fi
+            if [ "$explicit_extension" = "pbtxt" ]; then
+                validate_config_name "$explicit_path" "$explicit_name"
+            else
+                explicit_config="${explicit_path%.*}.pbtxt"
+                if [ -f "$explicit_config" ]; then
+                    validate_config_name "$explicit_config" "$explicit_name"
+                fi
+            fi
+        fi
+        explicit_seen="$explicit_seen $explicit_name"
+        explicit_count=$((explicit_count + 1))
+    done <<EOF_INPUTS
+$MODEL_INPUTS
+EOF_INPUTS
+    if [ "$explicit_count" -eq 0 ]; then
+        echo "error: MODEL_INPUTS contains no model records" >&2
+        exit 1
+    fi
+}
+
+same_directory() {
+    [ -d "$1" ] && [ -d "$2" ] || return 1
+    same_left=$(CDPATH='' cd "$1" 2>/dev/null && pwd -P) || return 1
+    same_right=$(CDPATH='' cd "$2" 2>/dev/null && pwd -P) || return 1
+    [ "$same_left" = "$same_right" ]
+}
+
+# Detect duplicate selected primary entries and ambiguous environment-override
+# suffixes before publishing either. Companions (.bin and .pbtxt) deliberately
+# do not count as primaries.
+check_catalog_conflicts() {
+    catalog_seen=""
+    catalog_override_seen=""
+    for catalog_entry in "$STAGE_DIR"/*; do
+        [ -e "$catalog_entry" ] || continue
+        catalog_entry_name=$(basename "$catalog_entry")
+        if [ -d "$catalog_entry" ]; then
+            catalog_model="$catalog_entry_name"
+            catalog_extension=""
+        else
+            case "$catalog_entry_name" in
+                *.*) catalog_extension=${catalog_entry_name##*.} ;;
+                *) catalog_extension="" ;;
+            esac
+            case "$catalog_extension" in
+                onnx | plan | engine | xml | pte | tflite | torchscript | pt | pb | dali | json)
+                    catalog_model=${catalog_entry_name%.*}
+                    ;;
+                *) continue ;;
+            esac
+        fi
+        model_selected "$catalog_model" || continue
+        validate_model_name "$catalog_model"
+        case " $catalog_seen " in
+            *" $catalog_model "*)
+                echo "error: multiple artifacts for model '$catalog_model' in $STAGE_DIR" >&2
+                exit 1
+                ;;
+        esac
+        if [ "$catalog_extension" = "onnx" ]; then
+            catalog_override_key=$(model_override_key "$catalog_model")
+            if tensorrt_override_key_in_use "$catalog_override_key"; then
+                case " $catalog_override_seen " in
+                    *" $catalog_override_key "*)
+                        echo "error: TensorRT model names normalize to the active environment override suffix '$catalog_override_key'" >&2
+                        echo "       rename one model or remove its per-model TRT_*_${catalog_override_key} setting" >&2
+                        exit 1
+                        ;;
+                esac
+                catalog_override_seen="$catalog_override_seen $catalog_override_key"
+            fi
+        fi
+        catalog_seen="$catalog_seen $catalog_model"
+    done
+}
+
+check_hidden_catalog_entries() {
+    for hidden_entry in "$STAGE_DIR"/.[!.]* "$STAGE_DIR"/..?*; do
+        [ -e "$hidden_entry" ] || continue
+        if [ "$STAGER_IGNORE_UNKNOWN" = "true" ]; then
+            echo "ignoring hidden catalog entry: $hidden_entry"
+            continue
+        fi
+        echo "error: hidden catalog entry is not stageable: $hidden_entry" >&2
+        echo "       set STAGER_IGNORE_UNKNOWN=true to skip it" >&2
+        exit 1
+    done
+}
+
+check_hidden_model_entries() {
+    hidden_model_dir="$1"
+    for hidden_model_entry in "$hidden_model_dir"/.[!.]* "$hidden_model_dir"/..?*; do
+        [ -e "$hidden_model_entry" ] || continue
+        if [ "$STAGER_IGNORE_UNKNOWN" = "true" ]; then
+            echo "ignoring hidden model entry: $hidden_model_entry"
+            continue
+        fi
+        echo "error: hidden model entry is not stageable: $hidden_model_entry" >&2
+        echo "       set STAGER_IGNORE_UNKNOWN=true to skip it" >&2
+        exit 1
+    done
+}
+
 # Leftovers from a run killed partway through. Removed before anything is
 # scanned so a half-written directory can never be published by a later pass.
+# This cleanup is why the repository has a strict single-writer contract.
 if [ -d "$MODEL_REPOSITORY" ]; then
     find "$MODEL_REPOSITORY" -maxdepth 2 -type d -name '.stager-tmp.*' -exec rm -rf {} + 2>/dev/null || true
+    find "$MODEL_REPOSITORY" -maxdepth 2 -type f -name '.stager-config.*' -exec rm -f {} + 2>/dev/null || true
+    find "$MODEL_REPOSITORY" -maxdepth 3 -type f \( -name '.model-stager-state.[0-9]*' -o -name '.model-stager-output.[0-9]*' \) -exec rm -f {} + 2>/dev/null || true
 fi
 
 staged_any=""
+stage_dir_single_model=""
+
+if [ -z "$MODEL_INPUTS" ] && [ -d "$STAGE_DIR" ]; then
+    check_hidden_catalog_entries
+    if is_single_model_tree "$STAGE_DIR"; then
+        stage_dir_single_model="yes"
+    fi
+fi
+
+if [ -n "$MODEL_INPUTS" ]; then
+    validate_explicit_inputs
+    stage_explicit_inputs
+elif [ ! -d "$STAGE_DIR" ]; then
+    echo "error: staging directory not found: $STAGE_DIR" >&2
+    exit 1
+elif same_directory "$STAGE_DIR" "$MODEL_REPOSITORY" && [ -n "$MODELS_WANTED" ]; then
+    echo "error: cannot filter MODELS in place; use a separate MODEL_REPOSITORY" >&2
+    exit 1
+elif [ -n "$stage_dir_single_model" ]; then
+    single_model=""
+    for model_wanted in $MODELS_WANTED; do
+        if [ -n "$single_model" ]; then
+            echo "error: a single-model repository needs exactly one MODELS name" >&2
+            exit 1
+        fi
+        single_model="$model_wanted"
+    done
+    if [ -z "$single_model" ]; then
+        echo "error: a single-model repository needs its name in MODELS" >&2
+        exit 1
+    fi
+    stage_tree "$STAGE_DIR" "$single_model"
+    model_mark_found "$single_model"
+    staged_any="yes"
+else
+    check_catalog_conflicts
 
 for entry in "$STAGE_DIR"/*; do
     [ -e "$entry" ] || continue
@@ -452,6 +980,11 @@ for entry in "$STAGE_DIR"/*; do
     if [ -d "$entry" ]; then
         if ! model_selected "$entry_name"; then
             continue
+        fi
+        check_hidden_model_entries "$entry"
+        if ! is_single_model_tree "$entry"; then
+            echo "error: input directory is not one repository-shaped model: $entry" >&2
+            exit 1
         fi
         stage_tree "$entry" "$entry_name"
         model_mark_found "$entry_name"
@@ -507,33 +1040,38 @@ for entry in "$STAGE_DIR"/*.pbtxt; do
     [ -f "$entry" ] || continue
     model_name=$(basename "$entry" .pbtxt)
 
+    if ! model_selected "$model_name"; then
+        continue
+    fi
+
+    # Always route ensembles through their dedicated layout and drift checks,
+    # including on restarts where their model directory already exists.
+    if is_ensemble_config "$entry"; then
+        stage_ensemble_config "$entry" "$model_name"
+        model_mark_found "$model_name"
+        staged_any="yes"
+        continue
+    fi
+
     if [ ! -d "$MODEL_REPOSITORY/$model_name" ]; then
         # An ensemble has no model file of its own: the graph lives entirely in
         # config.pbtxt and the version directory is legally empty. So a config
         # with no model beside it is a whole model when it declares an ensemble,
         # and an orphaned overlay -- almost always a basename typo -- otherwise.
-        if is_ensemble_config "$entry"; then
-            ensemble_dir="$MODEL_REPOSITORY/$model_name/$MODEL_VERSION"
-            mkdir -p "$ensemble_dir"
-            cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
-            echo "staged ensemble $MODEL_REPOSITORY/$model_name (version $MODEL_VERSION empty by design)"
-            staged_any="yes"
-            continue
-        fi
         echo "error: $entry has no matching model in the repository" >&2
         echo "       a config for a model that is not staged is usually a" >&2
         echo "       basename mismatch; an ensemble needs platform: \"ensemble\"" >&2
         exit 1
     fi
 
-    cp "$entry" "$MODEL_REPOSITORY/$model_name/config.pbtxt"
-    echo "applied config overlay $MODEL_REPOSITORY/$model_name/config.pbtxt"
+    copy_config "$entry" "$MODEL_REPOSITORY/$model_name" "$model_name"
     # The model this configures is in the repository, so the run produced
     # something servable. Without this, a restart whose staging directory holds
     # only an ensemble config -- already staged, so nothing new is written --
     # would report an empty repository and refuse to start.
     staged_any="yes"
 done
+fi
 
 # A requested model that was not in STAGE_DIR is an error, not a smaller
 # repository. Serving three of the four models a deployment asked for looks
