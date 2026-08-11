@@ -1,0 +1,16 @@
+# KServe (https://github.com/kserve/kserve) selects a runtime from modelFormat
+# and makes storageUri local to it. The PVC contents are already in the repository
+# shape expected by NVIDIA Triton Inference Server
+# (https://github.com/triton-inference-server/server), so no stager is involved.
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: repository-backed-runtime
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: triton
+        version: "2"
+      runtime: kserve-tritonserver
+      storageUri: pvc://model-repository/

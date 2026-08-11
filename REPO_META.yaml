@@ -22,5 +22,7 @@ constraints:
   # The tool must not gain knowledge of any server's protocol, any model's
   # tensor names, or any task's semantics. It maps artifacts to filenames.
   server_neutral: true
+  backend_neutral_default: true
   model_agnostic: true
+  local_inputs_only: true
   posix_sh_only: true

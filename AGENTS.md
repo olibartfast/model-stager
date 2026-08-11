@@ -18,11 +18,17 @@ These are the reason the tool is reusable. Breaking one is a design change, not
 a bug fix, and needs to be argued for explicitly:
 
 - **Server-neutral.** No knowledge of any server's protocol, flags, or lifecycle.
-  The only server-facing knowledge is the filename convention in
-  `target_filename`, and adding a server means adding a case there.
+  Server-facing knowledge is limited to the filename convention in
+  `target_filename` and structural consistency checks for Triton's ensemble
+  marker and optional top-level config name. Tensor, backend, and task settings
+  remain opaque.
+- **Backend-neutral by default.** Portable inputs remain portable. Conversion is
+  an explicit operator request and an optional image capability, never inferred
+  from a runtime or model name.
 - **Model-agnostic.** No model's name, tensor names, or shapes appear anywhere.
-  A model's name comes from its staged filename; per-model settings arrive as
-  environment suffixes whose values are the operator's business.
+  A model's name comes from its staged filename or explicit input record;
+  per-model settings arrive as environment suffixes whose values are the
+  operator's business.
 - **Task-agnostic.** Staging maps artifacts to filenames. It does not know what a
   model is *for*; task metadata is carried through `config.pbtxt` untouched, and
   never interpreted here.
@@ -30,11 +36,19 @@ a bug fix, and needs to be argued for explicitly:
   no arrays, no `local`, no `[[ ]]`, no `${var,,}`.
 - **Single file.** `bin/model-stager` stays self-contained so it can be `COPY`d
   into any image without a directory of sourced helpers.
+- **Local inputs only.** [KServe](https://github.com/kserve/kserve), a storage
+  initializer, or the orchestrator makes artifacts local. This tool does not
+  implement S3, GCS, PVC, HTTP, registry, or authentication clients.
 - **Fail loud.** An artifact that cannot be staged as asked is an error. Never
   substitute a different backend or silently skip a file — a dropped model
   surfaces much later as a 404, far from its cause.
 - **Idempotent and atomic.** Staging re-runs on every restart. Skip finished
-  work; publish a version by renaming a temp directory, never file by file.
+  work only after verifying its input and output fingerprints; publish a version
+  by renaming a temp directory, never file by file. `config.pbtxt` belongs to
+  the model directory, not a version, and may be atomically updated without
+  rebuilding immutable model artifacts.
+- **Single writer.** Concurrent processes must not write one repository. Stale
+  temp cleanup and atomic publication assume one owning stager.
 
 ## MANDATORY: How to refer to other projects
 
@@ -58,7 +72,7 @@ Documentation is read by people who know none of these projects.
 ## Build, Test, and Development Commands
 
 ```bash
-tests/test-model-stager.sh                              # 132 assertions
+tests/test-model-stager.sh                              # 271 assertions
 shellcheck bin/model-stager tests/test-model-stager.sh
 ```
 
