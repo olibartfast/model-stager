@@ -40,6 +40,9 @@ mkdir -p "$BIN"
 cat >"$BIN/trtexec" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >>"$TRTEXEC_LOG"
+if [ "${TRTEXEC_READ_STDIN:-false}" = "true" ]; then
+    IFS= read -r consumed || true
+fi
 if [ "${TRTEXEC_FAIL:-false}" = "true" ]; then
     exit 1
 fi
@@ -77,7 +80,8 @@ new_case() {
 }
 
 run_stager() {
-    STAGE_DIR="$STAGE" MODEL_REPOSITORY="$REPO" REPOSITORY_LAYOUT="${REPOSITORY_LAYOUT:-neuriplo}" "$STAGER" "$@" \
+    STAGE_DIR="$STAGE" MODEL_REPOSITORY="$REPO" REPOSITORY_LAYOUT="${REPOSITORY_LAYOUT:-neuriplo}" \
+        ONNX_BACKEND="${ONNX_BACKEND:-tensorrt}" "$STAGER" "$@" \
         >"$WORK/$CASE/out.log" 2>&1
     return $?
 }
@@ -117,6 +121,15 @@ expect_log_contains() {
     fi
 }
 
+expect_log_not_contains() {
+    if grep -qF -- "$2" "$1"; then
+        fail "$CASE: log unexpectedly contains '$2'"
+        sed 's/^/      /' "$1"
+    else
+        pass "$CASE: log does not contain '$2'"
+    fi
+}
+
 # =============================================================================
 echo "=== Case 1: heterogeneous flat staging ==="
 new_case heterogeneous
@@ -126,7 +139,7 @@ printf 'tflite' >"$STAGE/classifier.tflite"
 printf 'xml' >"$STAGE/segmenter.xml"
 printf 'bin' >"$STAGE/segmenter.bin"
 printf 'dali' >"$STAGE/preprocess.dali"
-printf 'graph' >"$STAGE/yolo_ensemble.json"
+printf 'graph' >"$STAGE/graph-model.json"
 printf 'prebuilt' >"$STAGE/depth.plan"
 
 SERVER_EXEC="model-server --models=$REPO" run_stager --port 8080
@@ -139,7 +152,7 @@ expect_file "classifier/1/model.tflite"
 expect_file "segmenter/1/model.xml"
 expect_file "segmenter/1/model.bin"
 expect_file "preprocess/1/model.dali"
-expect_file "yolo_ensemble/1/model.json"
+expect_file "graph-model/1/model.json"
 expect_file "depth/1/model.plan"
 expect_log_contains "$SERVE_LOG" "--models=$REPO"
 expect_log_contains "$SERVE_LOG" "--port 8080"
@@ -250,18 +263,18 @@ expect_absent "detector/.stager-tmp.1.999"
 # =============================================================================
 echo "=== Case 9: tree-form staging is copied verbatim ==="
 new_case tree-form
-mkdir -p "$STAGE/raft/3"
-printf 'engine' >"$STAGE/raft/3/model.plan"
-printf 'labels' >"$STAGE/raft/3/labels.txt"
-printf 'config' >"$STAGE/raft/config.pbtxt"
+mkdir -p "$STAGE/tree-model/3"
+printf 'engine' >"$STAGE/tree-model/3/model.plan"
+printf 'labels' >"$STAGE/tree-model/3/labels.txt"
+printf 'config' >"$STAGE/tree-model/config.pbtxt"
 run_stager
 expect_exit $? 0
 # Verbatim means the version and the extra files survive: this is the escape
 # hatch for anything the flat form cannot express.
-expect_file "raft/3/model.plan"
-expect_file "raft/3/labels.txt"
-expect_file "raft/config.pbtxt"
-expect_absent "raft/1"
+expect_file "tree-model/3/model.plan"
+expect_file "tree-model/3/labels.txt"
+expect_file "tree-model/config.pbtxt"
+expect_absent "tree-model/1"
 
 # =============================================================================
 echo "=== Case 10: flat .pbtxt lands beside the version directory ==="
@@ -282,20 +295,20 @@ expect_exit $? 1
 # =============================================================================
 echo "=== Case 11: per-model TRT overrides ==="
 new_case per-model-shapes
-printf 'onnx' >"$STAGE/static_det.onnx"
-printf 'onnx' >"$STAGE/raft-large.onnx"
+printf 'onnx' >"$STAGE/static-model.onnx"
+printf 'onnx' >"$STAGE/dynamic-model.onnx"
 # One static model and one dynamic model in the same repository: a single global
 # TRT_SHAPES cannot express this, which is what the override exists for.
-TRT_SHAPES_RAFT_LARGE="input:1x3x480x640" TRT_PRECISION_STATIC_DET=fp32 run_stager
+TRT_SHAPES_DYNAMIC_MODEL="input:1x3x480x640" TRT_PRECISION_STATIC_MODEL=fp32 run_stager
 expect_exit $? 0
 expect_log_contains "$TRTEXEC_LOG" "--shapes=input:1x3x480x640"
-if grep -F -- "static_det" "$TRTEXEC_LOG" | grep -qF -- "--shapes="; then
+if grep -F -- "static-model" "$TRTEXEC_LOG" | grep -qF -- "--shapes="; then
     fail "$CASE: static model was given explicit shapes"
 else
     pass "$CASE: static model built without --shapes"
 fi
-if grep -F -- "static_det" "$TRTEXEC_LOG" | grep -qF -- "--fp16"; then
-    fail "$CASE: TRT_PRECISION_STATIC_DET=fp32 did not override the default"
+if grep -F -- "static-model" "$TRTEXEC_LOG" | grep -qF -- "--fp16"; then
+    fail "$CASE: TRT_PRECISION_STATIC_MODEL=fp32 did not override the default"
 else
     pass "$CASE: per-model precision override applied"
 fi
@@ -366,7 +379,7 @@ expect_log_contains "$SERVE_LOG" "--strict-readiness=true"
 echo "=== Case 16: Triton layout renames to Triton's conventions ==="
 new_case triton-layout
 printf 'onnx' >"$STAGE/detector.onnx"
-printf 'ts' >"$STAGE/pose.torchscript"
+printf 'ts' >"$STAGE/script-model.torchscript"
 printf 'graph' >"$STAGE/legacy.pb"
 printf 'xml' >"$STAGE/seg.xml"
 printf 'bin' >"$STAGE/seg.bin"
@@ -375,8 +388,8 @@ expect_exit $? 0
 expect_file "detector/1/model.plan"
 # Triton detects platform by filename, so a TorchScript must be model.pt and a
 # frozen graph model.graphdef whatever the staged extension was.
-expect_file "pose/1/model.pt"
-expect_absent "pose/1/model.torchscript"
+expect_file "script-model/1/model.pt"
+expect_absent "script-model/1/model.torchscript"
 expect_file "legacy/1/model.graphdef"
 expect_absent "legacy/1/model.pb"
 expect_file "seg/1/model.xml"
@@ -425,12 +438,12 @@ expect_log_contains "$WORK/$CASE/out.log" "unsupported REPOSITORY_LAYOUT"
 # =============================================================================
 echo "=== Case 19: dynamic models get an optimization profile ==="
 new_case dynamic-profile
-printf 'onnx' >"$STAGE/raft-large.onnx"
+printf 'onnx' >"$STAGE/dynamic-model.onnx"
 TRT_MIN_SHAPES="input1:1x3x256x256" \
     TRT_OPT_SHAPES="input1:1x3x520x960" \
     TRT_MAX_SHAPES="input1:1x3x1080x1920" run_stager
 expect_exit $? 0
-expect_file "raft-large/1/model.plan"
+expect_file "dynamic-model/1/model.plan"
 # A dynamic model needs min/opt/max together. --shapes builds no profile, so an
 # engine built with it cannot accept the range it was supposed to serve.
 expect_log_contains "$TRTEXEC_LOG" "--minShapes=input1:1x3x256x256"
@@ -443,7 +456,7 @@ else
 fi
 
 new_case partial-profile
-printf 'onnx' >"$STAGE/raft-large.onnx"
+printf 'onnx' >"$STAGE/dynamic-model.onnx"
 # Two of three is not a profile. Accepting it would build an engine whose
 # bounds are not the ones anyone asked for.
 TRT_MIN_SHAPES="input1:1x3x256x256" TRT_MAX_SHAPES="input1:1x3x1080x1920" run_stager
@@ -456,7 +469,7 @@ else
 fi
 
 new_case conflicting-shapes
-printf 'onnx' >"$STAGE/raft-large.onnx"
+printf 'onnx' >"$STAGE/dynamic-model.onnx"
 TRT_SHAPES="input1:1x3x520x960" \
     TRT_MIN_SHAPES="input1:1x3x256x256" \
     TRT_OPT_SHAPES="input1:1x3x520x960" \
@@ -465,17 +478,17 @@ expect_exit $? 1
 expect_log_contains "$WORK/$CASE/out.log" "both TRT_SHAPES and a min/opt/max profile"
 
 new_case per-model-profile
-printf 'onnx' >"$STAGE/raft-large.onnx"
-printf 'onnx' >"$STAGE/static_det.onnx"
+printf 'onnx' >"$STAGE/dynamic-model.onnx"
+printf 'onnx' >"$STAGE/static-model.onnx"
 # The real mixed case: one dynamic model needs a profile, and the static one
 # beside it must be built with no shape arguments at all.
-TRT_MIN_SHAPES_RAFT_LARGE="input1:1x3x256x256" \
-    TRT_OPT_SHAPES_RAFT_LARGE="input1:1x3x520x960" \
-    TRT_MAX_SHAPES_RAFT_LARGE="input1:1x3x1080x1920" run_stager
+TRT_MIN_SHAPES_DYNAMIC_MODEL="input1:1x3x256x256" \
+    TRT_OPT_SHAPES_DYNAMIC_MODEL="input1:1x3x520x960" \
+    TRT_MAX_SHAPES_DYNAMIC_MODEL="input1:1x3x1080x1920" run_stager
 expect_exit $? 0
-expect_file "raft-large/1/model.plan"
-expect_file "static_det/1/model.plan"
-if grep -F -- "static_det" "$TRTEXEC_LOG" | grep -qE -- "--(min|opt|max)Shapes="; then
+expect_file "dynamic-model/1/model.plan"
+expect_file "static-model/1/model.plan"
+if grep -F -- "static-model" "$TRTEXEC_LOG" | grep -qE -- "--(min|opt|max)Shapes="; then
     fail "$CASE: static model was given a profile"
 else
     pass "$CASE: profile applied only to the dynamic model"
@@ -489,8 +502,8 @@ new_case gpu-ensemble
 printf 'dali' >"$STAGE/preprocess.dali"
 printf 'onnx' >"$STAGE/detector.onnx"
 printf 'dali' >"$STAGE/postprocess.dali"
-cat >"$STAGE/yolo_pipeline.pbtxt" <<'PBTXT'
-name: "yolo_pipeline"
+cat >"$STAGE/pipeline.pbtxt" <<'PBTXT'
+name: "pipeline"
 platform: "ensemble"
 ensemble_scheduling {
   step [
@@ -507,12 +520,12 @@ expect_file "detector/1/model.plan"
 expect_file "postprocess/1/model.dali"
 # An ensemble has no model file: the graph is the config, and Triton requires the
 # version directory to exist but be empty.
-expect_file "yolo_pipeline/config.pbtxt"
-if [ -d "$REPO/yolo_pipeline/1" ] && [ -z "$(ls -A "$REPO/yolo_pipeline/1")" ]; then
+expect_file "pipeline/config.pbtxt"
+if [ -d "$REPO/pipeline/1" ] && [ -z "$(ls -A "$REPO/pipeline/1")" ]; then
     pass "$CASE: ensemble version directory exists and is empty"
 else
     fail "$CASE: ensemble version directory wrong"
-    find "$REPO/yolo_pipeline" | sed 's/^/      /'
+    find "$REPO/pipeline" | sed 's/^/      /'
 fi
 
 # =============================================================================
@@ -565,26 +578,26 @@ expect_log_contains "$WORK/$CASE/out.log" "no matching model in the repository"
 echo "=== Case 24: neuriplo ensembles stay graph files ==="
 new_case neuriplo-ensemble
 printf 'dali' >"$STAGE/preprocess.dali"
-printf '{"steps":[]}' >"$STAGE/yolo_ensemble.json"
+printf '{"steps":[]}' >"$STAGE/graph-model.json"
 run_stager
 expect_exit $? 0
 expect_file "preprocess/1/model.dali"
-expect_file "yolo_ensemble/1/model.json"
+expect_file "graph-model/1/model.json"
 
 # =============================================================================
 echo "=== Case 25: MODELS selects a subset of the artifact image ==="
 new_case models-subset
 # One artifact image carrying a catalogue; this deployment serves two of it.
-printf 'onnx' >"$STAGE/rfdetr-seg.onnx"
-printf 'onnx' >"$STAGE/yolo26-seg.onnx"
-printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
-printf 'onnx' >"$STAGE/yolo-pose.onnx"
-MODELS="rfdetr-pose,yolo-pose" run_stager
+printf 'onnx' >"$STAGE/catalog-a.onnx"
+printf 'onnx' >"$STAGE/catalog-b.onnx"
+printf 'onnx' >"$STAGE/catalog-c.onnx"
+printf 'onnx' >"$STAGE/catalog-d.onnx"
+MODELS="catalog-c,catalog-d" run_stager
 expect_exit $? 0
-expect_file "rfdetr-pose/1/model.plan"
-expect_file "yolo-pose/1/model.plan"
-expect_absent "rfdetr-seg"
-expect_absent "yolo26-seg"
+expect_file "catalog-c/1/model.plan"
+expect_file "catalog-d/1/model.plan"
+expect_absent "catalog-a"
+expect_absent "catalog-b"
 # Unselected models must cost nothing: an engine build is minutes.
 if [ "$(wc -l <"$TRTEXEC_LOG")" -eq 2 ]; then
     pass "$CASE: built only the selected models"
@@ -603,12 +616,12 @@ expect_file "b/1/model.plan"
 # =============================================================================
 echo "=== Case 26: a requested model that is not staged is an error ==="
 new_case models-missing
-printf 'onnx' >"$STAGE/rfdetr-pose.onnx"
+printf 'onnx' >"$STAGE/catalog-a.onnx"
 # Serving three of four looks healthy everywhere except the client that needs
 # the fourth, so a typo or a stale artifact image has to fail here.
-MODELS="rfdetr-pose,yolo-pose" run_stager
+MODELS="catalog-a,catalog-missing" run_stager
 expect_exit $? 1
-expect_log_contains "$WORK/$CASE/out.log" "requested but not staged: yolo-pose"
+expect_log_contains "$WORK/$CASE/out.log" "requested but not staged: catalog-missing"
 
 # =============================================================================
 echo "=== Case 27: MODELS unset still stages everything ==="
@@ -630,6 +643,452 @@ MODELS=wanted run_stager
 expect_exit $? 0
 expect_file "wanted/1/model.plan"
 expect_absent "unwanted"
+
+# =============================================================================
+echo "=== Case 29: MODELS ignores configs belonging to unselected models ==="
+new_case models-config-subset
+printf 'onnx' >"$STAGE/wanted.onnx"
+printf 'input { name: "x" }\n' >"$STAGE/wanted.pbtxt"
+printf 'onnx' >"$STAGE/unwanted.onnx"
+printf 'input { name: "x" }\n' >"$STAGE/unwanted.pbtxt"
+MODELS=wanted ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "wanted/1/model.onnx"
+expect_file "wanted/config.pbtxt"
+expect_absent "unwanted"
+
+# =============================================================================
+echo "=== Case 30: MODELS can select a config-only Triton ensemble ==="
+new_case models-ensemble
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/pipeline.pbtxt"
+MODELS=pipeline REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "pipeline/config.pbtxt"
+if [ -d "$REPO/pipeline/1" ]; then
+    pass "$CASE: empty ensemble version exists"
+else
+    fail "$CASE: empty ensemble version missing"
+fi
+
+# =============================================================================
+echo "=== Case 31: non-Triton layouts refuse a flat Triton ensemble ==="
+new_case ovms-refuses-triton-ensemble
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/pipeline.pbtxt"
+REPOSITORY_LAYOUT=ovms run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "cannot serve a Triton ensemble"
+expect_absent "pipeline"
+
+# =============================================================================
+echo "=== Case 32: conflicting flat artifacts fail instead of picking one ==="
+new_case duplicate-model
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'engine' >"$STAGE/model.plan"
+REPOSITORY_LAYOUT=triton ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "multiple artifacts for model 'model'"
+expect_absent "model"
+
+# =============================================================================
+echo "=== Case 33: ONNX pass-through is the backend-neutral default ==="
+new_case neutral-onnx-default
+printf 'onnx' >"$STAGE/model.onnx"
+STAGE_DIR="$STAGE" MODEL_REPOSITORY="$REPO" REPOSITORY_LAYOUT=triton "$STAGER" \
+    >"$WORK/$CASE/out.log" 2>&1
+expect_exit $? 0
+expect_file "model/1/model.onnx"
+expect_absent "model/1/model.plan"
+if [ -s "$TRTEXEC_LOG" ]; then
+    fail "$CASE: default invoked trtexec"
+else
+    pass "$CASE: default used no conversion backend"
+fi
+
+# =============================================================================
+echo "=== Case 34: a mounted single-model repository is recognized ==="
+new_case single-model-root
+mkdir -p "$STAGE/7"
+printf 'onnx' >"$STAGE/7/model.onnx"
+printf 'backend: "onnxruntime"\n' >"$STAGE/config.pbtxt"
+MODELS=mounted-model REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "mounted-model/7/model.onnx"
+expect_file "mounted-model/config.pbtxt"
+
+# =============================================================================
+echo "=== Case 35: MODEL_INPUTS maps names to independent local inputs ==="
+new_case explicit-inputs
+mkdir -p "$WORK/$CASE/inputs/tree/3"
+printf 'onnx' >"$WORK/$CASE/inputs/flat.onnx"
+printf 'plan' >"$WORK/$CASE/inputs/tree/3/model.plan"
+MODEL_INPUTS="flat=$WORK/$CASE/inputs/flat.onnx
+tree=$WORK/$CASE/inputs/tree" \
+    REPOSITORY_LAYOUT=triton ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "flat/1/model.onnx"
+expect_file "tree/3/model.plan"
+
+new_case explicit-inputs-missing
+MODEL_INPUTS="missing=$WORK/$CASE/does-not-exist" run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "input path not found"
+
+# =============================================================================
+echo "=== Case 36: unsafe flat-form versions are rejected ==="
+new_case unsafe-version
+printf 'onnx' >"$STAGE/model.onnx"
+MODEL_VERSION=../../outside ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "invalid MODEL_VERSION"
+expect_absent "model"
+
+# =============================================================================
+echo "=== Case 37: ambiguous directories fail instead of being guessed ==="
+new_case ambiguous-directory
+mkdir -p "$STAGE/model/variables"
+printf 'weights' >"$STAGE/model/variables/data"
+run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "not one repository-shaped model"
+expect_absent "model"
+
+# =============================================================================
+echo "=== Case 38: an existing repository can be validated in place ==="
+new_case repository-in-place
+mkdir -p "$REPO/model-a/1" "$REPO/model-b/2"
+printf 'a' >"$REPO/model-a/1/model.onnx"
+printf 'b' >"$REPO/model-b/2/model.onnx"
+STAGE="$REPO"
+run_stager
+expect_exit $? 0
+expect_file "model-a/1/model.onnx"
+expect_file "model-b/2/model.onnx"
+
+MODELS=model-a run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "cannot filter MODELS in place"
+
+# =============================================================================
+echo "=== Case 39: explicit model names must be unique ==="
+new_case duplicate-explicit-input
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'onnx' >"$STAGE/b.onnx"
+MODEL_INPUTS="same=$STAGE/a.onnx
+same=$STAGE/b.onnx" ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "multiple MODEL_INPUTS records"
+expect_absent "same"
+
+# =============================================================================
+echo "=== Case 40: stale atomic-config files are swept ==="
+new_case stale-config
+mkdir -p "$REPO/model"
+printf 'partial' >"$REPO/model/.stager-config.999"
+printf 'onnx' >"$STAGE/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "model/1/model.onnx"
+expect_absent "model/.stager-config.999"
+
+# =============================================================================
+echo "=== Case 41: warm flat versions must match the requested staging ==="
+new_case warm-version-contract
+printf 'torchscript' >"$STAGE/model-b.torchscript"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "model-b/1/model.pt"
+REPOSITORY_LAYOUT=neuriplo run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "existing version does not match requested staging"
+
+new_case warm-source-drift
+printf 'first' >"$STAGE/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+printf 'second' >"$STAGE/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "existing version does not match requested staging"
+
+new_case warm-backend-switch
+printf 'onnx' >"$STAGE/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "existing version does not match requested staging"
+
+new_case warm-output-drift
+printf 'onnx' >"$STAGE/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+printf 'tampered' >"$REPO/model/1/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "existing version does not match requested staging"
+
+new_case warm-config-drift
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'name: "model"\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+printf 'name: "model"\nmax_batch_size: 8\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_contains "$REPO/model/config.pbtxt" "max_batch_size: 8"
+
+new_case warm-overlay-only-drift
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'name: "model"\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+rm "$STAGE/model.onnx"
+printf 'name: "model"\nmax_batch_size: 8\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_contains "$REPO/model/config.pbtxt" "max_batch_size: 8"
+
+new_case warm-tree-drift
+mkdir -p "$STAGE/model/3"
+printf 'plan' >"$STAGE/model/3/model.plan"
+run_stager
+expect_exit $? 0
+printf 'changed' >"$STAGE/model/3/model.plan"
+run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "does not match repository-shaped input"
+
+new_case warm-tree-config-update
+mkdir -p "$STAGE/model/3"
+printf 'plan' >"$STAGE/model/3/model.plan"
+printf 'name: "model"\n' >"$STAGE/model/config.pbtxt"
+run_stager
+expect_exit $? 0
+printf 'name: "model"\nmax_batch_size: 8\n' >"$STAGE/model/config.pbtxt"
+run_stager
+expect_exit $? 0
+expect_log_contains "$REPO/model/config.pbtxt" "max_batch_size: 8"
+
+new_case warm-ensemble-config-drift
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/pipeline.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+printf 'platform: "ensemble"\nensemble_scheduling { step [] }\n' >"$STAGE/pipeline.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_log_contains "$REPO/pipeline/config.pbtxt" "step []"
+
+new_case adopt-untracked-onnx
+printf 'onnx' >"$STAGE/model.onnx"
+mkdir -p "$REPO/model/1"
+printf 'onnx' >"$REPO/model/1/model.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "model/1/.model-stager-state"
+expect_log_contains "$WORK/$CASE/out.log" "adopting untracked existing version"
+
+new_case adopt-untracked-engine
+printf 'onnx' >"$STAGE/model.onnx"
+mkdir -p "$REPO/model/1"
+printf 'old engine' >"$REPO/model/1/model.plan"
+ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "cannot verify existing TensorRT engine"
+STAGER_ADOPT_UNVERIFIED_TENSORRT=true ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 0
+expect_file "model/1/.model-stager-state"
+expect_log_contains "$WORK/$CASE/out.log" "WARNING: adopting unverified TensorRT engine"
+if [ -s "$TRTEXEC_LOG" ]; then
+    fail "$CASE: adoption rebuilt the existing engine"
+else
+    pass "$CASE: adoption did not rebuild the existing engine"
+fi
+
+new_case flat-to-ensemble
+printf 'onnx' >"$STAGE/model.onnx"
+REPOSITORY_LAYOUT=triton ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+rm "$STAGE/model.onnx"
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/model.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "ensemble version directory is not empty"
+
+new_case equivalent-layout-identity
+printf 'plan' >"$STAGE/model.plan"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+REPOSITORY_LAYOUT=neuriplo run_stager
+expect_exit $? 0
+expect_log_contains "$WORK/$CASE/out.log" "already staged and verified"
+
+new_case equivalent-extension-identity
+printf 'script' >"$STAGE/model.torchscript"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+rm "$STAGE/model.torchscript"
+printf 'script' >"$STAGE/model.pt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_log_contains "$WORK/$CASE/out.log" "already staged and verified"
+
+new_case stale-metadata-temp
+mkdir -p "$REPO/model/1"
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'onnx' >"$REPO/model/1/model.onnx"
+printf 'partial' >"$REPO/model/1/.model-stager-state.9999"
+printf 'partial' >"$REPO/model/1/.model-stager-output.9999"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_absent "model/1/.model-stager-state.9999"
+expect_absent "model/1/.model-stager-output.9999"
+
+# =============================================================================
+echo "=== Case 42: opaque configs prevent unsafe model renames ==="
+new_case explicit-config-rename
+printf 'onnx' >"$STAGE/detector.onnx"
+printf 'name: "detector"\n' >"$STAGE/detector.pbtxt"
+MODEL_INPUTS="vision=$STAGE/detector.onnx" ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "configured input cannot be renamed"
+expect_absent "vision"
+
+new_case tree-config-rename
+mkdir -p "$STAGE/1"
+printf 'onnx' >"$STAGE/1/model.onnx"
+printf 'name: "detector"\n' >"$STAGE/config.pbtxt"
+MODELS=vision run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "configured input cannot be renamed"
+expect_absent "vision"
+
+# =============================================================================
+echo "=== Case 43: explicit sibling configs are part of the input contract ==="
+new_case explicit-sibling-config
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'name: "model"\n' >"$STAGE/model.pbtxt"
+MODEL_INPUTS="model=$STAGE/model.onnx" ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "model/1/model.onnx"
+expect_file "model/config.pbtxt"
+
+# =============================================================================
+echo "=== Case 44: explicit mode diagnostics name the input mode ==="
+new_case blank-explicit-inputs
+MODEL_INPUTS='
+
+' run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "MODEL_INPUTS contains no model records"
+
+# =============================================================================
+echo "=== Case 45: conversion tools cannot consume the explicit input list ==="
+new_case explicit-stdin-isolation
+printf 'onnx' >"$STAGE/a.onnx"
+printf 'plan' >"$STAGE/b.plan"
+TRTEXEC_READ_STDIN=true MODEL_INPUTS="a=$STAGE/a.onnx
+b=$STAGE/b.plan" ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 0
+expect_file "a/1/model.plan"
+expect_file "b/1/model.plan"
+
+# =============================================================================
+echo "=== Case 46: OVMS accepts TensorFlow Lite artifacts ==="
+new_case ovms-tflite
+printf 'tflite' >"$STAGE/model.tflite"
+REPOSITORY_LAYOUT=ovms run_stager
+expect_exit $? 0
+expect_file "model/1/model.tflite"
+
+# =============================================================================
+echo "=== Case 47: catalog model names and hidden entries are validated ==="
+new_case invalid-catalog-name
+printf 'onnx' >"$STAGE/model a.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "invalid model name"
+expect_absent "model a"
+
+new_case hidden-catalog-entry
+printf 'onnx' >"$STAGE/.hidden.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "hidden catalog entry"
+
+new_case unselected-invalid-name
+printf 'onnx' >"$STAGE/wanted.onnx"
+printf 'onnx' >"$STAGE/odd name.onnx"
+MODELS=wanted ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "wanted/1/model.onnx"
+expect_absent "odd name"
+
+# =============================================================================
+echo "=== Case 48: nested tree inputs and override namespaces fail loud ==="
+new_case hidden-tree-entry
+mkdir -p "$STAGE/model/1"
+printf 'onnx' >"$STAGE/model/1/model.onnx"
+printf 'extra' >"$STAGE/model/.extra_weights.bin"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "hidden model entry is not stageable"
+expect_absent "model"
+
+new_case hidden-tree-entry-ignored
+mkdir -p "$STAGE/model/1"
+printf 'onnx' >"$STAGE/model/1/model.onnx"
+printf 'metadata' >"$STAGE/model/.DS_Store"
+STAGER_IGNORE_UNKNOWN=true ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_contains "$WORK/$CASE/out.log" "ignoring hidden model entry"
+expect_file "model/1/model.onnx"
+expect_absent "model/.DS_Store"
+
+new_case catalog-override-collision-inactive
+printf 'onnx-a' >"$STAGE/model-a.onnx"
+printf 'onnx-b' >"$STAGE/model.a.onnx"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_file "model-a/1/model.onnx"
+expect_file "model.a/1/model.onnx"
+
+new_case catalog-override-collision
+printf 'onnx-a' >"$STAGE/model-a.onnx"
+printf 'onnx-b' >"$STAGE/model.a.onnx"
+TRT_PRECISION_MODEL_A=fp32 ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "active environment override suffix 'MODEL_A'"
+expect_log_contains "$WORK/$CASE/out.log" "rename one model or remove"
+
+new_case explicit-override-collision
+printf 'onnx-a' >"$STAGE/a.onnx"
+printf 'onnx-b' >"$STAGE/b.onnx"
+MODEL_INPUTS="model-a=$STAGE/a.onnx
+model.a=$STAGE/b.onnx" TRT_PRECISION_MODEL_A=fp32 ONNX_BACKEND=tensorrt run_stager
+expect_exit $? 1
+expect_log_contains "$WORK/$CASE/out.log" "active environment override suffix 'MODEL_A'"
+
+new_case ensemble-override-suffix-collision
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/ens-a.pbtxt"
+printf 'platform: "ensemble"\nensemble_scheduling {}\n' >"$STAGE/ens_a.pbtxt"
+REPOSITORY_LAYOUT=triton run_stager
+expect_exit $? 0
+expect_file "ens-a/config.pbtxt"
+expect_file "ens_a/config.pbtxt"
+
+new_case config-overlay-log
+printf 'onnx' >"$STAGE/model.onnx"
+printf 'name: "model"\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_contains "$WORK/$CASE/out.log" "applied config overlay"
+printf 'name: "model"\nmax_batch_size: 8\n' >"$STAGE/model.pbtxt"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_contains "$WORK/$CASE/out.log" "applied config overlay"
+ONNX_BACKEND=onnx_runtime run_stager
+expect_exit $? 0
+expect_log_not_contains "$WORK/$CASE/out.log" "applied config overlay"
 
 # =============================================================================
 echo

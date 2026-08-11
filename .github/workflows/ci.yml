@@ -68,14 +68,16 @@ jobs:
           printf 'ir' > staging/segmenter.xml
           printf 'weights' > staging/segmenter.bin
           printf 'onnx' > staging/detector.onnx
+          printf 'name: "detector"\nmax_batch_size: 0\n' > staging/detector.pbtxt
           docker run --rm \
             -e REPOSITORY_LAYOUT=ovms \
             -e ONNX_BACKEND=onnx_runtime \
             -v "$PWD/staging:/staging" \
-            -v "$PWD/repo:/models/repo" \
+            -v "$PWD/repo:/model_repository" \
             model-stager:ci
           test -f repo/segmenter/1/model.xml
           test -f repo/segmenter/1/model.bin
           test -f repo/detector/1/model.onnx
+          test -f repo/detector/config.pbtxt
           echo "staged tree:"
           find repo -type f | sort
