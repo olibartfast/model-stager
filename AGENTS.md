@@ -12,6 +12,29 @@ this author's own runtime and the project this tool was extracted from.
 
 `bin/model-stager` is the whole tool. `README.md` is the specification.
 
+## Where the documents live
+
+This repository is spec-driven. Four documents, four jobs — read the one that
+answers your question rather than the nearest one:
+
+| Document | Answers |
+|---|---|
+| `specs/mission.md` | What this tool is for, and what it deliberately is not. |
+| `specs/tech-stack.md` | How it is built: internal layers, the ordering guarantee, the data model, known weaknesses. |
+| `specs/roadmap.md` | What is done, what is planned in phases, and what is permanently out of scope. |
+| `README.md` | The user-facing specification of shipped behavior: every variable, every dispatch cell, every guarantee. |
+| `AGENTS.md` | How to work here: invariants, workflow, and the rules below. |
+
+`specs/` is the constitution; `README.md` is the contract. Where they disagree,
+`README.md` describes what ships and `specs/` describes what was intended — and
+the disagreement is a bug in one of them.
+
+Do not start a feature by editing code. Start from the next unchecked phase in
+`specs/roadmap.md` and the `feature-spec` skill, which interviews first and
+writes a dated `specs/YYYY-MM-DD-<name>/` directory holding `requirements.md`,
+`plan.md`, and `validation.md`. Roadmap items are checked off when the phase
+merges, not when the code is written.
+
 ## Invariants
 
 These are the reason the tool is reusable. Breaking one is a design change, not
